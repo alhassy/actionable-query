@@ -1,0 +1,262 @@
+;;; aq-render-splice.el --- Splice a view's rendered content into a host buffer  -*- lexical-binding: t; -*-
+
+;; Author: Musa Al-hassy <alhassy@gmail.com>
+
+;;; Commentary:
+
+;; The splice machinery — what makes `(my-view t)' inside an org file
+;; render the table inline rather than popping a dedicated buffer.
+;;
+;; Three concerns:
+;;
+;;   • Per-region dispatch commands — `aq-region-refresh',
+;;     `aq-region-filter', `aq-region-popup', `aq-region-row-up',
+;;     `aq-region-row-down'.  Each grabs `aq--ctx-at-point' and
+;;     dispatches to the matching ctx-aware helper.  Bound from
+;;     `aq--region-keymap' (in `interaction/keys.el').
+;;
+;;   • Host-buffer hook installers — `aq--install-host-help-echo'
+;;     installs the post-command hook that drives `:help-echo' for
+;;     spliced regions; both are buffer-locally idempotent.
+;;
+;;   • The splice itself — `aq--splice-view-into' takes a view buffer
+;;     and inserts its rendered content (verbatim, with `face' rewritten
+;;     to `font-lock-face') into the target buffer, layering
+;;     `aq--region-keymap' over each row and tagging the span with an
+;;     `aq-region-ctx' text-property.  `aq--insert-view-on-deliver' is
+;;     the async wrapper that defers the splice to the next deliver.
+
+;;; Code:
+
+(require 'cl-lib)
+(require 'transient)
+(require 'aq-state-region-ctx)         ; `aq-region-ctx*', `aq--ctx-at-point', `aq--rerender-region', `aq--suppress-help-echo-until'
+(require 'aq-state-dismissal)          ; `aq--post-deliver-hook'
+(require 'aq-interaction-row-reorder)  ; `aq--move-row'
+(require 'aq-interaction-bulk)         ; mark/unmark/bulk
+(require 'aq-interaction-popup)        ; `aq--current-row'
+(require 'aq-interaction-help-echo)    ; `aq--center-message', `aq--last-help-echo-obj'
+(require 'aq-interaction-keys)         ; `aq--region-keymap', `aq--actions->region-keymap', `aq--install-host-action-keys'
+(require 'inline-spinner)              ; ⏳ placeholder helpers — `aq--insert-pending-placeholder' &c.
+
+(declare-function vtable-current-object         "vtable")
+(declare-function vtable-sort-by-current-column "vtable")
+(declare-function aq--filter-prompt-and-apply   "aq-interaction-filters")
+
+;;; ─── per-region dispatch commands ────────────────────────────────────────────
+;;
+;; Six bindings — `g', `=', `m', `U', `B', `M-up', `M-down', `?' — share one
+;; shape: grab `aq--ctx-at-point', then dispatch to the ctx-aware helper.
+;; They live on the spliced region's `keymap' text-property (composed with
+;; vtable's own keymap that drives `:actions'), so they fire only when point
+;; sits inside a splice — outside, the host buffer's major-mode bindings win.
+
+(defun aq-region-refresh ()
+  "Refresh the spliced view at point.  Bound to `g' inside a splice region."
+  (interactive)
+  (if-let ((ctx (aq--ctx-at-point)))
+      (aq--rerender-region ctx)
+    (user-error "Not inside a spliced view")))
+
+(defun aq-region-filter (arg)
+  "Filter the column at point by regex.  `C-u =' clears all filters in this region."
+  (interactive "P")
+  (if-let ((ctx (aq--ctx-at-point)))
+      (aq--filter-prompt-and-apply (aq-region-ctx-view-name ctx) arg)
+    (user-error "Not inside a spliced view")))
+
+(defun aq-region-popup ()
+  "Show the actions popup for the row at point.  Bound to `?'.
+
+Mirrors `aq--install-popup' but reads its action list from the
+`aq-region-ctx' under point, so co-existing splices each get their
+own menu.  `aq--current-row' is `setq'-stashed (not let-bound) because
+transient is asynchronous — the closures fire after this fn has
+returned."
+  (interactive)
+  (if-let ((ctx (aq--ctx-at-point)))
+      (progn
+        (setq aq--current-row (vtable-current-object))
+        (eval `(transient-define-prefix aq--region-transient-popup ()
+                 "Actionable-query row actions"
+                 ["Row Actions"
+                  :class transient-column
+                  ,@(cl-loop for (key desc fn) in (aq-region-ctx-actions ctx)
+                             collect (let ((f fn))
+                                       `(,key ,desc
+                                              (lambda ()
+                                                (interactive)
+                                                (funcall ',f aq--current-row)))))]
+                 [["Structural"
+                   ("m"  "Mark for bulk action"  actionable-query-mark-row)
+                   ("U"  "Unmark all"            actionable-query-unmark-all)
+                   ("B"  "Bulk action"           actionable-query-bulk-action-interactive)
+                   ("M-<up>"   "Move row up"     ,(lambda () (interactive) (aq--move-row -1)))
+                   ("M-<down>" "Move row down"   ,(lambda () (interactive) (aq--move-row  1)))]
+                  ["Vtable"
+                   ("g"  "Refresh table"         aq-region-refresh)
+                   ("="  "Filter column"         aq-region-filter)
+                   ("S"  "Toggle sort"           vtable-sort-by-current-column)]]
+                 ["" ("C-g" "Dismiss" transient-quit-one)]) t)
+        (call-interactively 'aq--region-transient-popup))
+    (user-error "Not inside a spliced view")))
+
+(defun aq-region-row-up ()
+  "Move row at point up.  Bound to `M-<up>' inside a splice region."
+  (interactive)
+  (aq--move-row -1))
+
+(defun aq-region-row-down ()
+  "Move row at point down.  Bound to `M-<down>' inside a splice region."
+  (interactive)
+  (aq--move-row  1))
+
+;;; ─── host-buffer hook installers ────────────────────────────────────────────
+
+(defvar-local aq--host-hook-installed nil
+  "Non-nil once `aq--install-host-help-echo' has armed this buffer.
+Buffer-local; idempotency flag for the splice's post-command-hook
+installer, so multiple `(my-view t)' calls into the same host buffer
+don't pile up duplicate hooks.")
+
+(defun aq--install-host-help-echo ()
+  "Install a buffer-local `post-command-hook' that drives `:help-echo'
+on spliced regions.  Idempotent — runs once per host buffer.
+
+Reads the `aq--help-echo' and `vtable-object' text-properties at point
+on every command; when both are present, calls the lambda and messages
+the result.  Mirrors `aq--install-help-echo' but reads the callback
+from the property rather than a buffer-local closure, so multiple
+spliced views can co-exist in one host buffer with their own help-echos."
+  (unless aq--host-hook-installed
+    (setq aq--host-hook-installed t)
+    (add-hook 'post-command-hook
+              (lambda ()
+                (when (> (float-time) aq--suppress-help-echo-until)
+                  (when-let* ((_ (get-text-property (point) 'aq--spliced-view))
+                              (fn  (get-text-property (point) 'aq--help-echo))
+                              (obj (get-text-property (point) 'vtable-object)))
+                    (unless (eq obj aq--last-help-echo-obj)
+                      (setq aq--last-help-echo-obj obj)
+                      (when-let ((msg (funcall fn obj)))
+                        (message "%s" (aq--center-message msg)))))))
+              nil :local)))
+
+;;; ─── splice machinery ──────────────────────────────────────────────────────
+
+(cl-defun aq--splice-view-into (src-buf target-buf pos
+                                        &key help-echo-fn view-name actions async-fn)
+  "Insert the rendered content of SRC-BUF at POS in TARGET-BUF.
+
+The actual characters are inserted verbatim ---so on save/reload the
+table survives as plain ASCII rather than evaporating to an empty
+string--- but every `face' property is rewritten to `font-lock-face'
+so that `org-mode''s font-lock pass leaves the row colours alone.
+
+`:actions' survive the splice via the `keymap' text-property that
+`make-vtable' installs on each row.  When VIEW-NAME is non-nil we
+*also* layer `aq--region-keymap' (composed with the existing keymap)
+to bring `g'/`='/`m'/`U'/`B'/`M-up'/`M-down'/`?' into the region ---
+all dispatched per-region via the `aq-region-ctx' attached as a
+text-property over the span.  HELP-ECHO-FN, when non-nil, is the
+`:help-echo' lambda; a buffer-local post-command hook is armed in
+TARGET-BUF that reads the lambda from the property at point.
+
+Demonstrative of the lolcat trick in `fortune--insert-lolcat-button'
+---we take the durability-friendly half: real characters in the
+buffer, font-lock kept at bay via `font-lock-face'.
+
+We deliberately do *not* strip any properties here ---`keymap',
+`vtable-object', `display' all carry essential behaviour.
+
+Leaves point at the end of the spliced span ---like `insert' ---so
+callers composing further prose after `(view :insert t)' can chain
+naturally.  No `save-excursion': when an async deliver lands while
+the user has navigated elsewhere, point will jump to the splice
+site.  The alternative ---vtables silently appearing off-screen---
+is worse, and the cached-deliver path positively requires this
+contract so interleaved `:insert' + `(insert ...)' calls compose in
+source order rather than collapsing in reverse."
+  (let ((content (with-current-buffer src-buf
+                   (buffer-substring (point-min) (point-max)))))
+    ;; 1.  Convert `face' → `font-lock-face' so jit-lock will not
+    ;;     overwrite vtable's row colours during refontification.
+    (let ((idx 0) (len (length content)))
+      (while (< idx len)
+        (let ((next (or (next-single-property-change idx 'face content) len))
+              (face (get-text-property idx 'face content)))
+          (when face
+            (put-text-property idx next 'font-lock-face face content)
+            (put-text-property idx next 'face nil content))
+          (setq idx next))))
+    ;; 2.  Compose the per-region keymap on top of whatever vtable
+    ;;     already painted.  We build an explicit actions-map from the
+    ;;     ACTIONS triples so that user keys (e.g. RET) work regardless of
+    ;;     whether vtable's internal keymap survived the buffer-substring.
+    ;;     actions-map sits at the top (highest priority), then
+    ;;     aq--region-keymap (g/=/m/U/B/?/M-up/M-down), then vtable's own
+    ;;     keymap (S/sort/etc.) from the existing property.
+    (when view-name
+      (let ((actions-map (aq--actions->region-keymap actions))
+            (idx 0) (len (length content)))
+        (while (< idx len)
+          (let* ((next     (or (next-single-property-change idx 'keymap content) len))
+                 (existing (get-text-property idx 'keymap content))
+                 (composed (make-composed-keymap
+                            actions-map
+                            (if existing
+                                (make-composed-keymap aq--region-keymap existing)
+                              aq--region-keymap))))
+            (put-text-property idx next 'keymap composed content)
+            (setq idx next)))))
+    ;; 3.  Tag splice + help-echo properties (legacy hook reads these).
+    (put-text-property 0 (length content) 'aq--spliced-view t content)
+    (when help-echo-fn
+      (put-text-property 0 (length content) 'aq--help-echo help-echo-fn content))
+    ;; 4.  Insert into the host, then build markers around the new
+    ;;     content and attach the full `aq-region-ctx' as a property
+    ;;     over the span.  `begin' has default insertion-type (nil:
+    ;;     stays put when text is inserted at it) and `end' is type-t
+    ;;     (slides forward as content is appended) — exactly what
+    ;;     `aq--rerender-region' relies on.
+    (with-current-buffer target-buf
+      (goto-char pos)
+      (let ((inhibit-read-only t)
+            (begin (copy-marker pos))
+            end)
+        (insert content)
+        (setq end (copy-marker (point) t))
+        (when view-name
+          (let ((ctx (make-aq-region-ctx
+                      :view-name    view-name
+                      :begin        begin
+                      :end          end
+                      :actions      actions
+                      :help-echo-fn help-echo-fn
+                      :async-fn     async-fn)))
+            (put-text-property begin end 'aq--region-ctx ctx))))
+      (when help-echo-fn
+        (aq--install-host-help-echo))
+      (when (and view-name actions)
+        (aq--install-host-action-keys actions)))))
+
+(cl-defun aq--insert-view-on-deliver (view-buf target-buf pos
+                                               &key help-echo-fn view-name actions async-fn)
+  "After the next async delivery into VIEW-BUF, splice its content into TARGET-BUF at POS.
+Uses a one-shot entry in `aq--post-deliver-hook' so it fires exactly once.
+HELP-ECHO-FN, VIEW-NAME, ACTIONS, ASYNC-FN are forwarded to
+`aq--splice-view-into' — together they let the spliced region carry a
+full `aq-region-ctx' for `g'/`='/`m'/etc."
+  (with-current-buffer view-buf
+    (letrec ((hook (lambda ()
+                     (aq--splice-view-into view-buf target-buf pos
+                                           :help-echo-fn help-echo-fn
+                                           :view-name    view-name
+                                           :actions      actions
+                                           :async-fn     async-fn)
+                     (setq aq--post-deliver-hook
+                           (delq hook aq--post-deliver-hook)))))
+      (push hook aq--post-deliver-hook))))
+
+(provide 'aq-render-splice)
+;;; aq-render-splice.el ends here

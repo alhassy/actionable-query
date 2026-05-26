@@ -1,0 +1,1018 @@
+#+title: actionable-query — Turn any query into an interactive, actionable view
+#+author: Musa Al-hassy
+#+options: toc:2
+
+* TODOs
+
+ I defined
+
+   (actionable-query-defview my/first-view0 
+                          "My first view"
+                          :objects '("one" "two" "three")
+                          :actions '(("RET" "Print it" (lambda (it) (message-box "You picked: %s" it))))
+                          :help-echo (lambda (it) (format "Row value: %s" it)))
+
+   Then, I invoked
+
+   (my/first-view0 :insert t)
+
+   Then the RET action behaves as expected in fundamental-mode,
+   but in oRg-mode, RET just insets a neline. 
+
+   All :actions should be active on the table in its region.
+
+* async notes -- useful for newcomerss!
+
+ ;;; ─── async object loading ───────────────────────────────────────────────────
+      880  ;;
+      881 -;; Emacs is single-threaded: when your code runs, nothing else does — no                                                                                                                                                          
+      882 -;; redraws, no keystrokes, nothing.  "Blocking" means your code sits and waits                                                                                                                                                    
+      883 -;; for something (a network response, a file read) and Emacs is frozen the                                                                                                                                                        
+      884 -;; whole time.  `url-retrieve-synchronously' does exactly this — it spins in a                                                                                                                                                    
+      885 -;; loop checking every 50 ms until the HTTP response arrives.                                                                                                                                                                     
+      886 -;; `:objects' in `actionable-query-defview' is unified: its shape determines the mode.                                                                                                                                            
+      887 -;;                                                                                                                                                                                                                                
+      888 -;; `url-retrieve' (no -synchronously) is different: it starts the request and                                                                                                                                                     
+      889 -;; returns immediately.  You hand it a callback — a function — and Emacs                                                                                                                                                          
+      890 -;; continues normally.  When the response eventually lands, Emacs calls your                                                                                                                                                      
+      891 -;; callback with the data.  Emacs stays responsive the whole time.                                                                                                                                                                
+      881 +;; `:objects' in `actionable-query-defview' dispatches on shape:                                                                                                                                                                  
+      882 +;;   • Plain list      → static; passed directly to `make-vtable'.                                                                                                                                                                
+      883 +;;   • 0-arg function  → sync thunk; called on each open/`g' refresh.                                                                                                                                                             
+      884 +;;   • 1-arg function  → async; called with a CALLBACK argument.                                                                                                                                                                  
+      885 +;;                       Call (funcall callback objects) when data is ready.                                                                                                                                                      
+      886 +;;                       The buffer shows ⏳ until the callback fires; `g' re-fires.                                                                                                                                              
+      887  ;;
+      893 -;;                                                                                                                                                                                                                                
+      894 -;; `:objects' in `actionable-query-defview' is unified: its shape determines the mode.                                                                                                                                            
+      895 -;;                                                                                                                                                                                                                                
+      896 -;;   • Plain list             → static; passed directly to `make-vtable'.                                                                                                                                                         
+      897 -;;   • 0-arg function         → sync thunk; called on each open/`g' refresh.                                                                                                                                                      
+      898 -;;                              vtable's own `:objects-function' does this, but                                                                                                                                                   
+      899 -;;                              actionable-query intercepts `:objects' uniformly so the                                                                                                                                           
+      900 -;;                              other two modes work through the same keyword.                                                                                                                                                    
+      901 -;;   • 1-arg function         → async; called with a CALLBACK argument.                                                                                                                                                           
+      902 -;;                              Call (funcall callback objects) when data is ready.                                                                                                                                               
+      903 -;;                                                                                                                                                                                                                                
+      904 -;; Why async needs special treatment: `make-vtable' calls `:objects-function'                                                                                                                                                     
+      905 -;; synchronously, so a network fetch there freezes Emacs until the response                                                                                                                                                       
+      906 -;; lands.  `url-retrieve' (unlike `url-retrieve-synchronously') is                                                                                                                                                                
+      907 -;; callback-driven — it returns immediately and fires a continuation when the                                                                                                                                                     
+      908 -;; HTTP response arrives.  We cannot "return" from it.                                                                                                                                                                            
+      909 -;;                                                                                                                                                                                                                                
+      910 -;; The 1-arg async path therefore:                                                                                                                                                                                                
+      911 -;;   1. Seeds the buffer with a "⏳ Loading…" spinner so it opens instantly.                                                                                                                                                      
+      912 -;;   2. Fires the 1-arg fn right after.  The caller owns the mechanism —                                                                                                                                                          
+      913 -;;      `url-retrieve', `make-process', a timer, whatever.                                                                                                                                                                        
+      914 -;;   3. When data lands, the caller calls `(funcall callback objects)'.                                                                                                                                                           
+      915 -;;      We swap in the real rows via `(setf (vtable-objects table) objects)'                                                                                                                                                      
+      916 -;;      + `vtable-revert'.                                                                                                                                                                                                        
+      917 -;;   4. `g' resets to "⏳ Loading…" and re-fires the same fn.                                                                                                                                                                     
+      918 -;;                                                                                                                                                                                                                                
+      919 -;; Example (1-arg async):                                                                                                                                                                                                         
+      920 -;;   (actionable-query-defview "HN RSS"                                                                                                                                                                                           
+      921 -;;     :objects (lambda (callback)                                                                                                                                                                                                
+      922 -;;                (url-retrieve URL                                                                                                                                                                                               
+      923 -;;                  (lambda (_status)                                                                                                                                                                                             
+      924 -;;                    (funcall callback (parse-results)))))                                                                                                                                                                       
+      925 -;;     :columns …                                                                                                                                                                                                                 
+      926 -;;     :actions …)                                                                                                                                                                                                                
+      927 -;;                                                                                                                                                                                                                                
+      928 -;; Both `aq--fetch-rss' (RSS 2.0) and `aq--fetch-atom' (Atom) produce                                                                                                                                                             
+      929 -;; the same plist shape, so :columns, :actions, and :help-echo are reusable                                                                                                                                                       
+      930 -;; across feed types without any view-level changes.                                                                                                                                                                              
+      931 -;;                                                                                                                                                                                                                                
+      932 -;; GROUPED RESULTS: if the callback delivers a flat alternating list                                                                                                                                                              
+      933 -;; ("Group A" list-A "Group B" list-B …), actionable-query renders each group as a                                                                                                                                                
+      934 -;; separately titled vtable in the same buffer.  Detection heuristic: the                                                                                                                                                         
+      935 -;; first element is a string and the second is a list.                                                                                                                                                                            
+      888 +;; Grouped delivery: if the callback passes ("Group A" list-A "Group B" list-B …),                                                                                                                                                
+      889 +;; each group renders as a separate titled vtable in the same buffer.
+      
+* Elevator pitch
+
+Emacs is /full/ of interfaces built on the pattern "query some data
+source; show the results; let the user act on them." Every Emacs user
+already lives inside one: =M-x= itself is a query over all interactive
+commands, with ~RET~ to execute.
+
+Same pattern, different substrate, repeated all over Emacs:
+
+| Command        | Query                                | Actions                                 |
+|----------------+--------------------------------------+-----------------------------------------|
+| =M-x=            | all interactive commands             | ~RET~ to execute                          |
+| =dired=          | files in a directory                 | visit, rename, delete, chmod, shell out |
+| =proced=         | running processes                    | signal, kill, renice                    |
+| =buffer-menu=    | open buffers                         | switch, kill, save                      |
+| =org-agenda=     | TODOs and scheduled items            | reschedule, mark done, drill in         |
+| =magit-log=      | git commits                          | show, checkout, revert                  |
+
+=actionable-query= extends the tradition to *arbitrary* data sources.
+The query can be a shell command, an HTTP request, an RSS feed, a
+bookmark list, a curated personal playlist, a JSON payload — anything
+that produces a list of items. The actions are whatever you declare them
+to be.
+
+Under the hood we use =vtable= for tabular rendering and =org-ql-views=
+for view registration — so =org-ql-view= opens your views by name, =g=
+refreshes, and =q= buries the buffer, all with zero extra wiring.
+
+** Why not just =vtable=?
+
+=vtable= renders a table.  It doesn't answer:
+
+- *How do I fetch data asynchronously without freezing Emacs?*
+  ~url-retrieve~ is callback-driven; ~make-vtable~ expects data up-front.
+  Wiring a spinner, swapping in rows on callback, and handling ~g~-refresh
+  is non-trivial boilerplate every async view duplicates.
+
+- *How do I let users snooze/dismiss rows and have that survive a session restart?*
+  =vtable= has no persistence layer.  You'd need a hash table, a date-based
+  expiry scheme, =savehist= registration, and resurrection logic — per view.
+
+- *How do I surface all my keybindings discoverably?*
+  =vtable='s ~:actions~ silently binds keys; users who don't read the source
+  won't find them.  A ~?~ transient that lists every action with its
+  description is a separate =transient= integration to build from scratch.
+
+- *How do I group results from multiple async sources into one buffer?*
+  Fetching N feeds in parallel, assembling them into titled sections, and
+  rendering each as a separate vtable — with a unified snooze/filter layer
+  on top — is substantial orchestration that has nothing to do with the
+  domain logic of any single view.
+
+- *How do I wire a row to an Org heading so standard =org-agenda= nav
+  (RET, TAB, I, o) just works?*
+  The ~org-marker~ / ~org-hd-marker~ text-property protocol, kept live on
+  every cursor movement, is an ~org-agenda-mode~ implementation detail most
+  users shouldn't have to know.
+
+- *How do I get clock-in, scheduling, TODO cycling, and all the other
+  org-agenda commands working on arbitrary rows?*
+  ~agenda.el~ closes that gap: any view with ~:org~ wired up gets the full
+  suite of org-agenda actions automatically — including auto-creating an Org
+  heading in ~org-default-notes-file~ when none exists yet.
+
+=actionable-query= is the ergonomic layer on top of =vtable= that answers
+all of these — the same way =dired= is to raw file I/O and =proced= is to
+raw process listings.  One macro, ~actionable-query-defview~, and you get
+async loading, session-persistent snoozing, a ~?~ transient, grouped
+multi-table rendering, column filters, bulk marking, row reordering,
+hearting, auto-refresh, RSS/Atom/CLI helpers, Org-marker wiring, full
+org-agenda command parity, and org-ql query views — all without touching
+any of the underlying machinery yourself.
+
+* Installation
+
+No MELPA yet. Clone the repo and load from your init:
+
+#+begin_src emacs-lisp
+(load-file "~/actionable-query/actionable-query.el")
+#+end_src
+
+Dependencies: =org-ql= (MELPA), =vtable= (built into Emacs 29+),
+=transient= (built into Emacs 29+).
+
+~agenda.el~ and ~actionable-query-scheduler.el~ are loaded automatically
+by the main file.
+
+* Hello, world
+
+Maybe start with super simple:
+
+(actionable-query-defview :objects '("one" "two" "three"))
+
+Then add actions?
+
+The smallest useful view: three strings, each with a message on ~RET~.
+
+#+begin_src emacs-lisp
+(actionable-query-defview my/first-view
+  "My first view"
+  :objects '("one" "two" "three")
+  :actions '(("RET" "Print it" (lambda (it) (message "You picked: %s" it))))
+  :help-echo (lambda (it) (format "Row value: %s" it)))
+#+end_src
+
+Open it with ~M-x org-ql-view~ → select "My first view", or evaluate:
+
+#+begin_src emacs-lisp
+(org-ql-view "My first view")
+#+end_src
+
+Press ~RET~ on any row → message. Press ~g~ → refresh. Press ~q~ → bury.
+The muscle memory is already yours.
+
+* The ~actionable-query-defview~ macro
+
+~actionable-query-defview~ registers a named view in ~org-ql-views~.
+All keyword arguments are either intercepted by the library (listed
+below) or forwarded verbatim to =vtable='s ~make-vtable~.
+
+** Optional symbol name — ~M-x~ command + insert-at-point
+
+Prefix the view title with an unquoted symbol to generate a named
+interactive command:
+
+#+begin_src emacs-lisp
+;; Old form (still works):
+(actionable-query-defview "Gerrit Patches" :objects … :actions '())
+
+;; New form — also defines `my-gerrit' as an interactive command:
+(actionable-query-defview my-gerrit "Gerrit Patches" :objects … :actions '())
+#+end_src
+
+With the symbol form, ~M-x my-gerrit~ opens the dedicated view buffer
+as usual.  The command also accepts an optional argument for
+insert-at-point:
+
+| Call                        | Effect                                                 |
+|-----------------------------+--------------------------------------------------------|
+| ~(my-gerrit)~ / ~M-x my-gerrit~ | Open the view's dedicated buffer (normal behaviour). |
+| ~(my-gerrit t)~               | Insert cached content at point in the current buffer. |
+| ~(my-gerrit 'fetch-latest)~   | Fire a fresh fetch, then insert at point on delivery. |
+
+This makes it trivial to compose multiple views into a single
+"Weekly Review" buffer:
+
+#+begin_src emacs-lisp
+(with-current-buffer (get-buffer-create "*Weekly Review*")
+  (erase-buffer)
+  (insert "* Blocked patches\n\n")
+  (my-gerrit 'fetch-latest)
+  (insert "\n\n* Reviews needed\n\n")
+  (my-reviews 'fetch-latest))
+#+end_src
+
+** ~:objects~ — what to show
+
+Three shapes, dispatched at runtime:
+
+#+begin_src emacs-lisp
+;; 1. Plain list — static, evaluated once at definition time.
+:objects '("apple" "banana" "cherry")
+
+;; 2. 0-arg function — sync thunk, re-called on every open / `g' refresh.
+:objects (lambda () (directory-files "~/Downloads" t "\\.pdf\\'"))
+
+;; 3. 1-arg function — async; receives a CALLBACK.
+;;    Shows ⏳ Loading… until (funcall callback objects) fires.
+;;    `g' re-fires the fetch from scratch.
+:objects (lambda (callback)
+           (url-retrieve "https://news.ycombinator.com/rss"
+             (lambda (_status)
+               (funcall callback (aq--parse-rss-items
+                                   (xml-parse-region (point) (point-max)))))))
+#+end_src
+
+Async callbacks may also deliver *grouped* results — an alternating
+=(\"Title\" objects-list …)= plist — and the library renders one titled
+vtable per group automatically.
+
+** ~:columns~ — how to render rows
+
+Standard =vtable= column specs; each column is a plist:
+
+#+begin_src emacs-lisp
+:columns '((:name "Date"  :width 12
+                  :getter (lambda (o &rest _) (plist-get o :date)))
+           (:name "Title" :width 60
+                  :getter (lambda (o &rest _) (plist-get o :title))))
+#+end_src
+
+When omitted, a single fallback column renders each row as ~(format "%s" obj)~.
+
+*** Column alignment
+
+Pass ~:align~ on any column plist.  =vtable= natively supports ~'left~ and
+~'right~; actionable-query extends this with ~'center~, which centers both
+the header text and cell values within the column width:
+
+#+begin_src emacs-lisp
+(actionable-query-defview "Demo: centered columns"
+  :objects '("Alpha" "Beta" "Gamma")
+  :columns '((:name "Item" :width 20 :align 'center)))
+#+end_src
+
+~Item~ headers and cells are centered; omitting ~:align~ defaults to left.
+
+** ~:actions~ — what the user can do
+
+A list of ~("key" "description" fn)~ triples. Each triple is:
+- registered as a vtable action (bound to =key= in the buffer), and
+- collected into the ~?~ transient popup with its description shown.
+
+#+begin_src emacs-lisp
+:actions `(("RET" "Open in browser"  ,(lambda (o) (browse-url (plist-get o :url))))
+           ("w"   "Copy URL"         ,(lambda (o) (kill-new (plist-get o :url))))
+           ("c"   "Capture as TODO"  ,(lambda (o)
+                                        (org-capture-string
+                                         (format "* TODO [[%s][%s]]"
+                                                 (plist-get o :url)
+                                                 (plist-get o :title))
+                                         "t"))))
+#+end_src
+
+Two actions are always prepended automatically when absent:
+- ~r~ — snooze (dismiss) the row per ~:snooze-period~
+- ~w~ — copy the row to the kill-ring
+
+** ~:help-echo~ — row tooltips
+
+A ~(lambda (row) …)~ returning a string; messaged in the minibuffer on
+each cursor movement.
+
+#+begin_src emacs-lisp
+:help-echo (lambda (o) (plist-get o :description))
+#+end_src
+
+** ~:prose~ and ~:prose-bottom~ — free-form buffer text
+
+Forms evaluated and inserted before / after the vtable:
+
+#+begin_src emacs-lisp
+:prose (insert (propertize "Fetched from Hacker News\n\n"
+                            'face '(:slant italic :foreground "gray50")))
+#+end_src
+
+** ~:snooze-period~ — how long dismissed rows stay hidden
+
+One of ~'tomorrow~ (default), ~'next-week~, or ~'forever~. Snooze state
+is persisted across sessions via =savehist=; press ~R~ to resurrect.
+
+** ~:auto-refresh~ — keep the view fresh automatically
+
+A human-readable interval string:
+
+#+begin_src emacs-lisp
+:auto-refresh "30 minutes"   ; or "1 hour", "1 day"
+#+end_src
+
+Installs a repeating timer; press ~g~ to refresh manually at any time.
+
+** Slow-fetch guard — skip auto-fetch when a view is expensive
+
+When a fetch completes, its duration is recorded globally (keyed by view
+name).  On the *next* visit to that buffer, if the last fetch took longer
+than ~actionable-query-auto-fetch-slow-threshold~ seconds (default ~1.0~),
+the view opens instantly with the cached data already displayed and a
+message in the echo area:
+
+#+begin_example
+This view took 12 seconds last time, so not auto-fetched; press `g' to fetch latest.
+#+end_example
+
+This keeps expensive views — ones that hit slow APIs or take 10+ seconds —
+from blocking every visit.  The data is often fresh enough; you reach for
+~g~ when you actually want an update.
+
+Set the threshold to ~nil~ to disable the guard entirely and always
+auto-fetch regardless of cost:
+
+#+begin_src emacs-lisp
+(setq actionable-query-auto-fetch-slow-threshold nil)
+#+end_src
+
+Or raise it for your tolerance:
+
+#+begin_src emacs-lisp
+(setq actionable-query-auto-fetch-slow-threshold 5.0)  ; skip only if > 5 s
+#+end_src
+
+** ~:group-by~ — partition rows into labelled sections
+
+A ~(lambda (obj) string)~ that assigns each row to a named group.
+The library renders one titled vtable per group in a single buffer.
+
+#+begin_src emacs-lisp
+:group-by (lambda (o) (if (string> (plist-get o :date) "2025") "Recent" "Older"))
+#+end_src
+
+Alternatively, deliver the groups directly from a 1-arg ~:objects~
+async function as an alternating ~("Group" objects-list …)= plist.
+
+** ~:hearting~ — favourite rows across sessions
+
+When ~t~, enables:
+- ~h~ — toggle ❤ on the current row
+- ~H~ — toggle "show hearted only" filter
+
+Hearts are persisted via =savehist= and survive restarts. On open, the
+view defaults to hearted-only when any hearts exist for that view name.
+
+** ~:org~ — link rows to Org headings
+
+A ~(lambda (it) …)~ returning an org marker or nil. On each cursor
+move the lambda is called; when it returns a live marker, ~org-marker~
+and ~org-hd-marker~ are set on that line — enabling standard
+~org-agenda-mode-map~ navigation (~RET~, ~TAB~, ~I~, ~o~) to jump to
+the linked Org heading.
+
+Setting ~:org~ also activates the full org-agenda command suite from
+~agenda.el~ — clock in/out, schedule, deadline, TODO cycling, priority,
+tags, effort, archive, and kill subtree — all on the standard keys.
+If the current row has no existing Org heading, one is created
+automatically in ~org-default-notes-file~.
+
+#+begin_src emacs-lisp
+:org (lambda (o) (org-find-exact-headline-in-buffer (plist-get o :title)))
+#+end_src
+
+*** ~actionable-query-resolve-org-markers~ — batch Org heading lookup
+
+When a view shows objects that correspond to Org headings (Jira tickets, git
+branches, project names), resolving the marker for each object is the same
+two-pass boilerplate every view duplicates.  ~actionable-query-resolve-org-markers~
+runs it once and returns a hash-table you can feed straight into ~:org~:
+
+#+begin_src emacs-lisp
+(defun actionable-query-resolve-org-markers (objects key-fn &optional fallback-fn)
+  "Return a hash-table mapping each object in OBJECTS to an Org marker.
+KEY-FN is called on each object and should return a string (e.g. a Jira
+ticket ID) that appears somewhere in a heading in `org-default-notes-file'.
+Optional FALLBACK-FN (object table) is called for objects still without a
+marker after Pass 1, and may set additional entries directly in TABLE.")
+#+end_src
+
+**Pass 1** — for each object whose ~(funcall key-fn obj)~ is a non-nil
+string, scan ~org-default-notes-file~ with ~re-search-forward~ for any
+heading containing that string; store ~point-marker~ in the table.
+
+**Pass 2** — call ~(funcall fallback-fn obj table)~ for each object still
+without a marker, if ~fallback-fn~ is non-nil.
+
+Typical wiring — call it once (e.g. in the async deliver callback), stash
+the table in a plain variable, then read from it O(1) in ~:org~:
+
+#+begin_src emacs-lisp
+(defvar my-org-cache (make-hash-table :test 'eq))
+
+(actionable-query-defview "My tickets"
+  :objects (lambda (cb)
+             (my-fetch-async
+              (lambda (items)
+                (setq my-org-cache
+                      (actionable-query-resolve-org-markers
+                       items
+                       (lambda (o) (plist-get o :jira-id))))
+                (funcall cb items))))
+  :org (lambda (o) (gethash o my-org-cache))
+  ...)
+#+end_src
+
+** ~:async-notifier~ — notify when async loading completes
+
+An arbitrary form evaluated in the view buffer immediately after the vtable
+is rendered following an async fetch.  Use this to fire a macOS notification,
+a minibuffer message, a sound, or anything else:
+
+#+begin_src emacs-lisp
+;; macOS Notification Center banner:
+(actionable-query-defview "feed/Hacker News"
+  :async-notifier (aq-notify-macos "feed/Hacker News" "Ready for your consumption")
+  :objects (lambda (cb) (aq--fetch-rss "https://news.ycombinator.com/rss" cb))
+  ...)
+
+;; Or a plain minibuffer message:
+(actionable-query-defview "My slow view"
+  :async-notifier (message "✅ My slow view loaded!")
+  ...)
+#+end_src
+
+The helper ~aq-notify-macos~ (from ~agenda.el~) fires ~osascript~
+asynchronously — Emacs never blocks waiting for the OS.
+
+** ~:row-colors~ — alternating row backgrounds
+
+A list of color name strings cycled across rows:
+
+#+begin_src emacs-lisp
+:row-colors '("thistle" "thistle1" "thistle2" "thistle3")
+#+end_src
+
+* Built-in keybindings
+
+Every =actionable-query-defview= buffer gets these automatically:
+
+| Key          | Action                                                      |
+|--------------+-------------------------------------------------------------|
+| ~g~            | Refresh (re-run ~:objects~)                                   |
+| ~Q~            | Abort an in-flight async fetch (deliver callback no-ops)    |
+| ~r~            | Snooze current row per ~:snooze-period~                       |
+| ~R~            | Resurrect all snoozed rows                                  |
+| ~w~            | Copy current row to kill-ring                               |
+| ~m~            | Mark row for bulk action (prefix = N rows)                  |
+| ~U~            | Unmark all marked rows                                      |
+| ~B~            | Bulk-action transient on marked rows                        |
+| ~=~            | Filter current column by regex                              |
+| ~C-u =~        | Clear all column filters                                    |
+| ~M-↑~ / ~M-↓~   | Reorder rows                                                |
+| ~?~            | Transient popup of all actions + commands                   |
+| ~q~            | Bury buffer                                                 |
+
+When ~:org~ is set, the following org-agenda keys are also available
+(see [[*Org-agenda command parity (~agenda.el~)]]):
+
+| Key        | Action                              |
+|------------+-------------------------------------|
+| ~I~          | Clock in to the linked Org heading  |
+| ~O~          | Clock out of the running clock      |
+| ~C-c C-s~    | Schedule the heading                |
+| ~C-c C-d~    | Set a deadline                      |
+| ~t~          | Cycle TODO state                    |
+| ~,~          | Set priority                        |
+| ~:~          | Edit tags                           |
+| ~E~          | Set Effort property                 |
+| ~$~          | Archive subtree                     |
+| ~C-k~        | Kill (cut) subtree                  |
+
+** Aborting async fetches with ~Q~
+
+Pressing ~Q~ while the ⏳ spinner is running immediately stops the
+animation and shows "Fetch aborted — press g to retry."  The in-flight
+network request (owned by your ~:objects~ lambda's ~url-retrieve~,
+~make-process~, etc.) may still complete in the background, but when it
+eventually fires its sentinel the deliver callback silently discards the
+result — no spurious render, no error.  Press ~g~ to start a fresh fetch.
+
+* Preset keywords via ~actionable-query-defview-def-keyword~
+
+When multiple views share the same shape (same columns, actions,
+help-echo), extract the defaults into a reusable preset keyword:
+
+#+begin_src emacs-lisp
+(actionable-query-defview-def-keyword :my-rss-feed (url)
+  "Defaults for an RSS 2.0 feed view.
+URL is the feed address, passed unevaluated to the async fetch."
+  `(:columns      actionable-query-rss-columns
+    :actions      actionable-query-rss-actions
+    :help-echo    actionable-query-rss-help-echo
+    :snooze-period 'tomorrow
+    :auto-refresh  "1 hour"
+    :objects       (lambda (cb) (aq--fetch-rss ,url cb))))
+
+;; Now each feed view is one line:
+(actionable-query-defview "feed/Hacker News"
+  :my-rss-feed "https://news.ycombinator.com/rss"
+  :row-colors '("thistle" "thistle1"))
+
+(actionable-query-defview "feed/Lobste.rs"
+  :my-rss-feed "https://lobste.rs/rss"
+  :row-colors '("LightCyan" "LightCyan1"))
+#+end_src
+
+Explicit kwargs at the call site always override preset defaults.
+
+* Org-agenda command parity (~agenda.el~)
+
+=agenda.el= is loaded automatically and makes any view with ~:org~
+a drop-in replacement for =org-agenda=.  Every org-agenda command
+delegates through a thin wrapper that:
+
+1. Reads ~org-hd-marker~ / ~org-marker~ off the current vtable line.
+2. If no marker is found, creates a minimal ~* TODO~ heading in
+   ~org-default-notes-file~ (with a ~CREATED~ timestamp) and uses that.
+3. Calls the corresponding native Org function in the source buffer
+   (wrapped in ~org-with-remote-undo~ so undo works across buffers).
+4. Refreshes the vtable display.
+
+** ~:org-ql~ — org-ql queries as first-class views
+
+The ~:org-ql~ preset keyword turns any org-ql sexp into a full
+actionable-query view in one line:
+
+#+begin_src emacs-lisp
+(actionable-query-defview "My TODOs"
+  :org-ql (and (todo "TODO") (scheduled :to today)))
+
+(actionable-query-defview "Urgent items"
+  :org-ql (and (todo) (priority "A")))
+
+(actionable-query-defview "This week's done"
+  :org-ql (and (done) (closed :from -7)))
+#+end_src
+
+The preset expands to:
+
+- ~:objects~ — a 0-arg thunk running ~org-ql-select~ across ~org-agenda-files~
+  with the ~element-with-markers~ action (so each row carries live Org markers).
+- ~:org~ — extracts ~:org-hd-marker~ from each element, wiring up all
+  org-agenda keys automatically.
+- ~:columns~ — sane defaults: TODO keyword, priority, headline, scheduled date, tags.
+- ~:actions~ — ~RET~ jumps to the heading in another window.
+
+Because ~:org~ is set, every org-agenda key (~I~, ~t~, ~C-c C-s~, …) works
+out of the box, and the view gains all the actionable-query affordances on
+top: hover info, snoozing, bulk actions, column filters, ~?~ transient, etc.
+
+** Default columns for ~:org-ql~ views
+
+The variable ~aq-org-ql-default-columns~ drives the default column layout.
+Override it globally or per-view:
+
+#+begin_src emacs-lisp
+;; Per-view override — keep only headline and tags:
+(actionable-query-defview "Tag browser"
+  :org-ql (todo)
+  :columns '((:name "Headline" :width 60
+                    :getter (lambda (el &rest _) (org-element-property :raw-value el)))
+             (:name "Tags"     :width 30
+                    :getter (lambda (el &rest _)
+                              (string-join (org-element-property :tags el) ":")))))
+#+end_src
+
+** Auto-creating Org headings on demand
+
+When a non-~:org-ql~ view has ~:org~ set and the current row maps to no
+existing heading, pressing any agenda key (~I~, ~C-c C-s~, ~t~, …)
+triggers ~aq-agenda--ensure-marker~:
+
+1. Calls ~actionable-query-resolve-org-markers~ to search
+   ~org-default-notes-file~ for an existing heading.
+2. If none found, inserts at ~(point-max)~:
+   #+begin_example
+   * TODO <key-string>
+     :PROPERTIES:
+     :CREATED:  [2026-05-16 Sat 14:30]
+     :END:
+   #+end_example
+3. Returns a live marker to the new heading — subsequent commands use it
+   without prompting again.
+
+** Rescheduling overlay
+
+~aq-agenda-show-new-time~ mirrors ~org-agenda-show-new-time~: after
+scheduling or setting a deadline, the new timestamp appears right-aligned
+on the current line (face: ~secondary-selection~) until the next vtable
+refresh.
+
+* Built-in feed helpers
+
+=actionable-query= ships helpers for the two most common async sources.
+
+** RSS 2.0 and Atom feeds
+
+#+begin_src emacs-lisp
+;; RSS 2.0 (<item>-based):
+(actionable-query-defview "feed/Hacker News"
+  :objects (lambda (cb) (aq--fetch-rss "https://news.ycombinator.com/rss" cb))
+  :columns actionable-query-rss-columns   ; Date / Title / Category
+  :actions actionable-query-rss-actions   ; RET=browse, e=eww, w=copy, c=capture
+  :help-echo actionable-query-rss-help-echo)
+
+;; Atom (<entry>-based, e.g. Planet Emacslife):
+(actionable-query-defview "feed/Planet Emacslife"
+  :objects (lambda (cb) (aq--fetch-atom "https://planet.emacslife.com/atom.xml" cb))
+  :columns actionable-query-rss-columns
+  :actions actionable-query-rss-actions)
+#+end_src
+
+Both helpers deliver plists of the shape:
+~(:title "…" :url "…" :date "…" :description "…" :categories (…))~
+
+** CLI / shell commands
+
+#+begin_src emacs-lisp
+(actionable-query-defview "🔥 Top CPU"
+  :objects (lambda (cb)
+             (aq--cli-async "ps -eo pid,%cpu,comm"
+                            nil   ; default parser: split stdout on newlines
+                            cb))
+  :actions '(("RET" "Kill process"
+              (lambda (line)
+                (let ((pid (string-to-number (car (split-string line)))))
+                  (when (yes-or-no-p (format "Kill PID %d? " pid))
+                    (signal-process pid 'SIGTERM)))))))
+#+end_src
+
+~aq--cli-async~ signature: ~(command parser callback)~
+- ~command~ — string (split on whitespace) or list of strings
+- ~parser~ — ~(raw-stdout → objects)~; nil defaults to splitting on newlines
+- ~callback~ — the 1-arg deliver function
+
+* Worked examples
+
+** Files in a directory (sync, with thumbnails)
+
+#+begin_src emacs-lisp
+(actionable-query-defview "Images in ~/Downloads"
+  :objects (lambda () (directory-files "~/Downloads" t "\\.jpg\\'"))
+  :columns `((:name "Name"      :width 30 :formatter file-name-nondirectory)
+             (:name "Thumbnail" :width "300px"
+                    :displayer ,(lambda (value max-width _tbl)
+                                  (propertize "*" 'display
+                                    (create-image value nil nil :max-width max-width)))))
+  :actions `(("RET" "Open in Emacs"    find-file)
+             ("o"   "Open with macOS"  ,(lambda (f)
+                                          (shell-command
+                                           (format "open %s" (shell-quote-argument f)))))
+             ("d"   "Delete to Trash"  ,(lambda (f)
+                                          (when (yes-or-no-p (format "Delete %s? " (file-name-nondirectory f)))
+                                            (delete-file f :trash)
+                                            (vtable-revert)))))
+  :help-echo (lambda (f)
+               (format "Size: %s"
+                       (file-size-human-readable
+                        (file-attribute-size (file-attributes f))))))
+#+end_src
+
+** Org-ql view with async notification
+
+#+begin_src emacs-lisp
+(actionable-query-defview "Today's agenda"
+  :org-ql (and (todo) (scheduled :on today))
+  :async-notifier (aq-notify-macos "Today's agenda" "Ready for your consumption")
+  :auto-refresh "15 minutes")
+#+end_src
+
+Open it, get a macOS banner when the query finishes, and have it refresh
+automatically every 15 minutes. Press ~I~ to clock in, ~t~ to cycle TODO,
+~C-c C-s~ to reschedule — all without leaving the view.
+
+** Grouped RSS feeds (multiple sources, one buffer)
+
+#+begin_src emacs-lisp
+(actionable-query-defview "feed/Tech News"
+  :objects
+  (lambda (callback)
+    (let* ((results (make-hash-table :test #'equal))
+           (feeds   '(("Hacker News" . "https://news.ycombinator.com/rss")
+                      ("Lobste.rs"   . "https://lobste.rs/rss")))
+           (done    0)
+           (n       (length feeds)))
+      (dolist (feed feeds)
+        (let ((name (car feed)) (url (cdr feed)))
+          (aq--fetch-rss url
+            (lambda (items)
+              (puthash name items results)
+              (when (= (cl-incf done) n)
+                (funcall callback
+                         (cl-loop for (n . _) in feeds
+                                  append (list n (gethash n results)))))))))))
+  :columns actionable-query-rss-columns
+  :actions actionable-query-rss-actions
+  :auto-refresh "30 minutes")
+#+end_src
+
+** Git-log standup view (sync, org-marker integration)
+
+#+begin_src emacs-lisp
+(defun my/git-log-recent (repo)
+  "Return commits by me in the past week as plists (:sha … :message …)."
+  (let* ((default-directory repo)
+         (author (string-trim (shell-command-to-string "git config user.email")))
+         (raw    (shell-command-to-string
+                  (format "git log --author=%s --since='1 week ago' --oneline"
+                          (shell-quote-argument author)))))
+    (delq nil
+          (mapcar (lambda (line)
+                    (when (string-match "\\([a-f0-9]+\\) \\(.*\\)" line)
+                      (list :sha (match-string 1 line) :message (match-string 2 line))))
+                  (split-string raw "\n" t)))))
+
+(actionable-query-defview "🗓️ What I've worked on this week"
+  :objects   (my/git-log-recent "~/.emacs.d")
+  :columns   '((:name "Commit" :getter (lambda (o &rest _) (plist-get o :message))))
+  :actions   '(("RET" "Show diff"
+                (lambda (row)
+                  (let ((default-directory "~/.emacs.d"))
+                    (magit-show-commit (plist-get row :sha))))))
+  :help-echo (lambda (row)
+               (let ((default-directory "~/.emacs.d"))
+                 (magit-show-commit (plist-get row :sha))
+                 (format "Showing diff for %s" (plist-get row :sha)))))
+#+end_src
+
+** Calendar events via gcalcli (CLI async)
+
+#+begin_src emacs-lisp
+(actionable-query-defview "Calendar events for Monday"
+  :columns '((:name "When"  :width 22 :getter (lambda (o &rest _) (plist-get o :when)))
+             (:name "Title"            :getter (lambda (o &rest _) (plist-get o :title))))
+  :objects (lambda (callback)
+             (let* ((now    (decode-time))
+                    (dow    (nth 6 now))
+                    (days   (let ((d (mod (- 1 dow) 7))) (if (= d 0) 7 d)))
+                    (monday (time-add (current-time) (* days 86400)))
+                    (d0     (format-time-string "%m/%d" monday))
+                    (d1     (format-time-string "%m/%d" (time-add monday 86400))))
+               (aq--cli-async
+                (format "gcalcli agenda --tsv %s %s" d0 d1)
+                (lambda (raw)
+                  (cl-loop for line in (split-string raw "\n" t)
+                           unless (string-prefix-p "start_date" line)
+                           collect (let ((cols (split-string line "\t")))
+                                     (list :when  (format "%s %s" (nth 0 cols) (nth 1 cols))
+                                           :title (nth 4 cols)))))
+                callback))))
+#+end_src
+
+* Calendar / scheduling helpers (~actionable-query-scheduler~)
+
+The companion file ~actionable-query-scheduler.el~ ships utilities for
+scheduling items without double-booking your calendar.  It is loaded
+automatically by the main file.
+
+** ~actionable-query-next-free-slot~ — find the next open time slot
+
+#+begin_src emacs-lisp
+(actionable-query-next-free-slot &optional duration-mins)
+#+end_src
+
+Returns an Org timestamp string (e.g. ~<2026-05-16 Sat 14:00>~) for the
+first free slot of ~duration-mins~ minutes (default 60).  The search:
+
+1. Inspects today's Org agenda files for all scheduled items that carry an
+   explicit ~HH:MM~ time component.
+2. Computes each item's end time from its ~Effort~ property (defaulting to 1 h).
+3. If an active clock is running /today/, treats ~(clock-start, now)~ as
+   busy too — no scheduling over yourself.
+4. Finds the first slot (rounded up to the nearest 15-minute boundary) that
+   fits within the 08:00–16:00 workday.
+5. If today is already full, rolls forward up to 14 days; pops a
+   non-blocking dialog announcing the spillover date.
+6. Signals ~user-error~ if no slot fits within the 14-day horizon.
+
+#+begin_src emacs-lisp
+;; Next 60-minute slot
+(actionable-query-next-free-slot)
+;; → "<2026-05-16 Sat 14:15>"
+
+;; Next 30-minute slot
+(actionable-query-next-free-slot 30)
+;; → "<2026-05-16 Sat 09:30>"
+#+end_src
+
+Useful in ~:actions~ to auto-schedule a captured TODO without staring at
+your calendar:
+
+#+begin_src emacs-lisp
+("s" "Schedule now"
+ (lambda (o)
+   (let ((stamp (actionable-query-next-free-slot
+                 (actionable-query-effort-from-times nil nil))))
+     (org-capture-string
+      (format "* TODO %s\nSCHEDULED: %s" (plist-get o :title) stamp)
+      "t"))))
+#+end_src
+
+** ~actionable-query-effort-from-times~ — duration string from two clock strings
+
+#+begin_src emacs-lisp
+(actionable-query-effort-from-times start end)
+#+end_src
+
+Returns an ~"H:MM"~ effort string from two ~"HH:MM"~ clock strings, or ~nil~
+on bad input (all-day events have no duration; we prefer ~nil~ over a
+fabricated ~"0:00"~ that would silently pass an effort-required check).
+
+#+begin_src emacs-lisp
+(actionable-query-effort-from-times "09:00" "10:30") ; → "1:30"
+(actionable-query-effort-from-times "14:00" "14:45") ; → "0:45"
+(actionable-query-effort-from-times nil nil)          ; → nil
+#+end_src
+
+** Running the scheduler tests
+
+#+begin_src sh
+emacs --batch -L ~/actionable-query -L ~/snap \
+      --eval '(package-initialize)' \
+      -l actionable-query-scheduler-tests.el -f ert-run-tests-batch-and-exit
+#+end_src
+
+27 tests cover ~effort-from-times~, ~--effort-minutes~, ~--round-up-15~,
+~--first-free-slot-on~, and ~next-free-slot~ — all with ~cl-letf~-mocked
+busy-interval data, so no live Org agenda is required.
+
+* Tips & Tricks
+
+** Colorful pill buttons in ~:prose~
+
+=actionable-query= doesn't ship a button renderer, but it takes only a
+small self-contained helper to get styled, clickable pill buttons —
+the kind you'd put in a ~:prose~ block above a table.
+
+#+begin_src emacs-lisp
+(defun my/insert-pill (label action &rest face-overrides)
+  "Insert a styled clickable pill button at point.
+LABEL is the visible text.  ACTION is either a URL string (opened
+with `browse-url') or a nullary function (called directly).
+FACE-OVERRIDES is an optional plist of face attributes that replace
+the defaults (:foreground \"cyan\", bold italic, released-button box)."
+  (let* ((fn         (if (stringp action)
+                         (lambda (_) (browse-url action))
+                       (lambda (_) (funcall action))))
+         (help-echo  (cond ((stringp action) action)
+                           ((and (symbolp action) (documentation action))
+                            (car (split-string (documentation action) "\n")))
+                           (t "Click to run")))
+         (face       (append face-overrides
+                             '(:foreground "cyan" :weight bold :slant italic
+                               :box (:line-width 2 :style released-button)))))
+    (insert " ")
+    (insert-text-button label
+                        'action     fn
+                        'follow-link t
+                        'face       face
+                        'mouse-face 'highlight
+                        'help-echo  help-echo)))
+#+end_src
+
+#+begin_src emacs-lisp
+;; Default cyan pill
+(my/insert-pill "🔗 Open Dashboard" "https://example.com")
+
+;; Orange warning pill
+(my/insert-pill "⚠️ Needs Attention" #'my-action :foreground "orange")
+#+end_src
+
+* Design notes
+
+** Why vtable?
+
+=vtable= (Emacs 29+) gives us sortable, resizable, filterable columns
+for free. Compared to rolling our own tabulated-list-mode, we get:
+- ~S~ to toggle sort by column
+- ~{~ / ~}~ to narrow/widen columns
+- ~M-←~ / ~M-→~ to navigate between columns
+- Proper column displayers, formatters, and getters
+
+We add on top: snoozing, hearting, bulk marking, column filtering by
+regex, row reordering, auto-refresh, grouped multi-table rendering, and
+a ~?~ transient that surfaces every action with its description.
+
+** Why org-ql-views?
+
+=org-ql= already has the infrastructure for named, openable, refreshable
+buffer views. We register into its =org-ql-views= alist so ~M-x
+org-ql-view~ surfaces all views by name. The =org-agenda-mode= substrate
+means ~q~ buries and standard agenda keybindings work without extra
+wiring.
+
+** Async model
+
+Emacs is single-threaded. ~url-retrieve~ (without =-synchronously=) is
+callback-driven — it starts the request and returns immediately, calling
+your function when the response lands. The 1-arg ~:objects~ lambda
+receives a CALLBACK; call ~(funcall callback objects)~ whenever your
+data is ready. The library seeds the buffer with a ⏳ spinner, swaps in
+the real rows on callback, and handles grouped vs flat delivery
+transparently.
+
+Pressing ~Q~ during a fetch sets a buffer-local abort flag; the deliver
+callback checks it on arrival and silently no-ops.  The underlying
+network request finishes in the background and is GC'd when done.
+
+** Snooze persistence
+
+Dismissed rows are stored in ~aq--dismissed~ (a hash table keyed by
+~(view-name . expiry-date-or-"forever")~) and added to
+=savehist-additional-variables= — so snooze state survives restarts.
+Expired daily-snooze keys are pruned automatically on each view open.
+Press ~R~ to resurrect all snoozed rows for the current view.
+
+Why snooze?
+
+Whatsapp has no way to snooze messages: To make them disappear for some time!
+
+Another example: 
+
+Jira tickets and Org trees have statuses, but Gerrit patches don't have a
+status, however sometimes some work needs to be paused since it's been
+deprioritised. There are two options:
+1. Perform a cross-check of Gerrit patches against their Jira tickets
+   and only surface patches whose Jiras are active.
+   - Downside: Some patches have no associated Jira; even worse, these
+     two async fetches result in a slow workflow.
+2. Make use of Gerrit tags, to tag items as paused then omit them from
+   the Gerrit query.
+   - Downside: When there's a stack of 10+ items, this can get annoying
+     and then I have to remember to remove them later on.
+
+   As such, I can simply snooze them and I'll be reminded something is snoozed
+   and can decide to act on that already in-flight work.  
+
+** Org-agenda command parity
+
+~agenda.el~ provides a thin dispatch layer:
+
+- *Every mutating command* (~org-clock-in~, ~org-schedule~, ~org-todo~, …)
+  is wrapped in ~org-with-remote-undo~ — so ~C-/~ undoes the source-buffer
+  change even from the view buffer.
+- *No marker = auto-create*: ~aq-agenda--ensure-marker~ creates a
+  ~* TODO~ heading in ~org-default-notes-file~ the first time any agenda
+  command is pressed on a row with no linked heading.
+- *Display*: ~aq-agenda-show-new-time~ right-aligns a ~S => <date>~ stamp
+  on the current line after scheduling, mirroring ~org-agenda-show-new-time~
+  exactly (text property, not a real overlay — cleaned up automatically on
+  the next vtable revert).
+** TODO Another usage 
+:PROPERTIES:
+:CREATED:  [2026-05-21 Thu 15:48]
+:END:
+
+Sometimes I have canned SQL queries, so now I can surface them via a table then
+press RET to execute the desired query and make use of help-echo to remind me of
+when/why I want to execute the query or other contextual info; e.g., relevant
+URLs.
+
