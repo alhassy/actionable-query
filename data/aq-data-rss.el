@@ -126,13 +126,21 @@ Differences from RSS 2.0:
      entries)))
 
 (defun aq--fetch-feed (url parser callback)
-  "Fetch URL asynchronously, parse with PARSER, and call CALLBACK with result plists."
+  "Fetch URL asynchronously, parse with PARSER, and call CALLBACK with result plists.
+A malformed response (HTTP error page, broken XML, …) delivers nil rather
+than silently dropping the callback — callers fanning out to several feeds
+rely on CALLBACK always firing exactly once."
   (url-retrieve
    url
    (lambda (_status)
-     (goto-char (point-min))
-     (re-search-forward "\n\n")
-     (funcall callback (funcall parser (xml-parse-region (point) (point-max)))))
+     (funcall callback
+              (or (condition-case err
+                      (progn
+                        (goto-char (point-min))
+                        (re-search-forward "\n\n")
+                        (funcall parser (xml-parse-region (point) (point-max))))
+                    (error (message "aq--fetch-feed: %s failed: %S" url err) nil))
+                  nil)))
    nil t t))
 
 (defun aq--fetch-rss (url callback)

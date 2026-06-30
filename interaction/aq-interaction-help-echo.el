@@ -30,14 +30,20 @@
 ;;; ─── help-echo ──────────────────────────────────────────────────────────────
 
 (defun aq--center-message (str)
-  "Fill STR to the frame width and center each line, for display via `message'."
+  "Fill STR to the frame width and center each line, for display via `message'.
+Existing newlines in STR are honoured as hard breaks: each line is wrapped and
+centered independently, so a multi-part help-echo stays multi-line instead of
+collapsing into one reflowed paragraph."
   (let ((width (frame-width)))
-    (with-temp-buffer
-      (insert str)
-      (let ((fill-column width))
-        (fill-paragraph))
-      (center-region (point-min) (point-max))
-      (buffer-string))))
+    (mapconcat
+     (lambda (line)
+       (with-temp-buffer
+         (insert (string-trim line))
+         (let ((fill-column width)) (fill-region (point-min) (point-max)))
+         (center-region (point-min) (point-max))
+         (string-trim-right (buffer-string) "\n")))
+     (split-string str "\n")
+     "\n")))
 
 (defvar-local aq--last-help-echo-obj nil
   "Most-recently messaged vtable object; guards against redundant `aq--center-message' calls.")

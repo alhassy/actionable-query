@@ -8,6 +8,8 @@
 
 (require 'actionable-query)
 
+(declare-function aq--heart-p "aq-state-dismissal")
+
 ;;; ─── paths & constants ───────────────────────────────────────────────────────
 
 (defconst whatsapp-cli-path
@@ -62,13 +64,14 @@ Baileys emits log noise to stderr — isolating it prevents contaminating stdout
 
 (defun whatsapp--send-async (jid msg &optional on-done)
   "Send MSG to JID via whatsapp-cli.js; show confirmation or error message."
-  (let ((buf (generate-new-buffer " *whatsapp-send*")))
+  (let* ((buf     (generate-new-buffer " *whatsapp-send*"))
+         (err-buf (generate-new-buffer " *whatsapp-send-err*")))
     (make-process
      :name    "whatsapp-send"
      :command (list "node" whatsapp-cli-path "send" jid msg)
      :buffer  buf
      :stderr  (make-pipe-process :name "whatsapp-send-err"
-                                 :buffer (generate-new-buffer " *whatsapp-send-err*")
+                                 :buffer err-buf
                                  :sentinel (lambda (p _)
                                              (when (eq (process-status p) 'closed)
                                                (kill-buffer (process-buffer p)))))
@@ -76,13 +79,20 @@ Baileys emits log noise to stderr — isolating it prevents contaminating stdout
      (lambda (proc _)
        (when (eq (process-status proc) 'exit)
          (let* ((raw      (with-current-buffer (process-buffer proc) (buffer-string)))
+                (err      (with-current-buffer err-buf (buffer-string)))
                 (json-str (when (string-match "{[^}]*}" raw) (match-string 0 raw)))
                 (result   (and json-str
                                (condition-case _ (json-parse-string json-str :object-type 'plist) (error nil)))))
            (kill-buffer (process-buffer proc))
-           (if (plist-get result :ok)
-               (aq--message "WhatsApp: sent to %s" jid)
-             (aq--message "WhatsApp send failed: %s" (string-trim raw)))
+           (cond
+            ((plist-get result :ok)
+             (aq--message "WhatsApp: sent to %s" jid))
+            ((string-match-p "Session rejected\\|Run: node .*auth" err)
+             (message "WhatsApp session expired — grab your phone, open WhatsApp → Settings → Linked Devices → Link a Device, and scan the QR code that's about to appear, then retry.")
+             (whatsapp/auth))
+            (t
+             (aq--message "WhatsApp send failed: %s"
+                          (string-trim (if (string-empty-p (string-trim raw)) err raw)))))
            (when on-done (funcall on-done result))))))))
 
 
@@ -104,18 +114,25 @@ Baileys emits log noise to stderr — isolating it prevents contaminating stdout
   (let* ((day (string-to-number (format-time-string "%u"))) ; 1=Mon … 7=Sun
          (phrases
           (pcase day
+            ;; Monday dua source: https://www.duas.org/monday.htm
             (1 ["Magnificent Monday to you, %s! 🌟"
                 "Monday Mubarak, %s — may this week open with blessings."
-                "A Marvel of a Monday, %s — the week is yours to shape! 💪"])
+                "A Marvel of a Monday, %s — the week is yours to shape! 💪"
+                "%s, a Monday dua for you:\nاَللَّهُمَّ أَوْلِنِي فِي كُلِّ يَومِ ٱثْنَيْنِ نِعْمَتَيْنِ مِنْكَ ثِنْتَيْنِ سَعَادَةً فِي أَوَّلِهِ بِطَاعَتِكَ وَنِعْمَةً فِي آخِرِهِ بِمَغْفِرَتِكَ\nGod, give me two gifts every Monday: a great start doing what You ask, and a clean slate by the end. 🤲"])
+            ;; Tuesday dua source: https://www.duas.org/tuesday.htm
             (2 ["Terrific Tuesday, %s! ✨"
                 "Tuesday Takeover, %s — may you conquer what yesterday left undone."
-                "Two-terrific-Tuesday, %s — one day wiser than Monday! 😄"])
+                "Two-terrific-Tuesday, %s — one day wiser than Monday! 😄"
+                "%s, a Tuesday dua for you:\nاَللَّهُمَّ وَهَبْ لِي فِي ٱلثُّلاثَاءِ ثَلاثاً لاَ تَدَعْ لِي ذَنْباً إِلاَّ غَفَرْتَهُ وَلاَ غَمّاً إِلاَّ أَذْهَبْتَهُ وَلاَ عَدُوّاً إِلاَّ دَفَعْتَهُ\nGod, give me three things every Tuesday: forgive every sin I carry, lift every worry I'm under, and turn back every enemy against me. 🤲"])
+            ;; Wednesday dua source: https://www.duas.org/wednesday.htm
             (3 ["Wonderful Wednesday, %s! 🌿"
-                "O Lord, today is Wednesday/Al-Arbaʿa — I ask You for 4 things for %s: health, joy, ease, and nearness to You. 🤲"
-                "Midweek magic, %s — you've made it halfway! 🎯"])
+                "Midweek magic, %s — you've made it halfway! 🎯"
+                "%s, a Wednesday dua for you:\nاَللَّهُمَّ ٱقْضِ لِي فِي ٱلأَرْبِعَاءِ اَرْبَعاً إِجْعَلْ قُوَّتِي فِي طَاعَتِكَ وَنَشَاطِي فِي عِبَادَتِكَ وَرَغْبَتِي فِي ثَوَابِكَ وَزُهْدِي فِيمَا يُوجِبُ لِي أَلِيمَ عِقَابِكَ\nGod, give me four things every Wednesday: strength to obey You, energy to worship You, hunger for Your reward, and the sense to walk away from anything that earns Your punishment. 🤲"])
+            ;; Thursday dua source: https://www.duas.org/thursday.htm
             (4 ["Tremendous Thursday, %s! 🚀"
                 "Al-Khamis Mubarak, %s — may the eve of Jummah bring you peace and anticipation. 🌙"
-                "Thor's Day, %s — strike your goals with full force today! ⚡"])
+                "Thor's Day, %s — strike your goals with full force today! ⚡"
+                "%s, a Thursday dua for you:\nاَللَّهُمَّ ٱقْضِ لِي فِي ٱلْخَمِيسِ خَمْساً لاَ يَتَّسِعُ لَهَا إِلاَّ كَرَمُكَ وَلاَ يُطِيقُهَا إِلاَّ نِعَمُكَ سَلامَةً أَقْوَىٰ بِهَا عَلَىٰ طَاعَتِكَ وَعِبَادَةً أَسْتَحِقُّ بِهَا جَزِيلَ مَثُوبَتِكَ وَسَعَةً فِي ٱلْحَالِ مِنَ ٱلرِّزْقِ ٱلْحَلالِ وَأَنْ تُؤْمِنَنِي فِي مَوَاقِفِ ٱلْخَوْفِ بِأَمْنِكَ وَتَجْعَلَنِي مِنْ طَوَارِقِ ٱلْهُمُومِ وَٱلْغُمُومِ فِي حِصْنِكَ\nGod, give me five things every Thursday, things only Your generosity can cover and only Your favor can sustain: the health to obey You, the worship that earns Your reward, an honest living with room to breathe, safety wherever fear finds me, and shelter from worry and grief. 🤲"])
             (5 ["Jummah Mubaraka, %s! 🌙"
                 "Happy Friday, %s — may your Jummah be blessed and your heart at rest. 🤲"
                 "Blessed Friday, %s — the best day of the week is yours! 💐"])
@@ -137,23 +154,31 @@ Baileys emits log noise to stderr — isolating it prevents contaminating stdout
   "Return the first space-delimited token of FULL-NAME."
   (car (split-string full-name)))
 
-(defun whatsapp--action-funny (o)
-  "Send a funny message for contact object O, with immediate and completion feedback."
+(defun whatsapp--action-funny (o view-name)
+  "Send a day-aware greeting + joke to contact object O, snoozing it in VIEW-NAME until Friday on success."
   (let* ((name (whatsapp--first-name (or (plist-get o :name) (plist-get o :phone) "?")))
-         (jid  (plist-get o :jid)))
-    (aq--message "Sending funny to %s…" name)
-    (whatsapp--send-async jid (whatsapp--funny-message name)
-      (lambda (result)
-        (if (plist-get result :ok)
-            (progn (whatsapp--open-chat o)
-                   (aq--message "Funny sent to %s!" name))
-          (aq--message "Failed to send funny to %s." name))))))
+         (jid  (plist-get o :jid))
+         (msg  (whatsapp--funny-message name))
+         (fri  (whatsapp--snooze-until-friday)))
+    (if (y-or-n-p (format "[Send the following] %s " msg))
+        (progn
+          (aq--message "Sending greeting to %s…" name)
+          (whatsapp--send-async jid msg
+            (lambda (result)
+              (if (plist-get result :ok)
+                  (progn (whatsapp--open-chat o)
+                         (aq--dismiss-until view-name (aq--obj-id o) fri)
+                         (when-let ((tbl (vtable-current-table)))
+                           (vtable-remove-object tbl o))
+                         (aq--message "Sent & snoozed until Friday (%s)!" fri))
+                (aq--message "Failed to send greeting to %s." name)))))
+      (message "Cancelled."))))
 
 (defun whatsapp--funny-message (name)
-  "Build a random ASCII-art greeting addressed to NAME."
+  "Build a day-aware greeting for NAME with a joke appended."
   (let ((art   (fortune :kind 'joke))
         (emoji (seq-random-elt [😁 💐 🌇 🥳 🥸 🤲 🚴 🫎 🍉 🍁])))
-    (format "Jummah Mubaraka %s %s\n```\n%s\n```" name emoji art)))
+    (format "%s %s\n```\n%s\n```" (whatsapp--day-message name) emoji art)))
 
 (defun whatsapp--session-exists-p ()
   "Return non-nil if a Baileys session exists (auth performed at least once)."
@@ -204,18 +229,36 @@ The session is saved to whatsapp-session/ and all future calls are headless."
                        callback))
 
 (actionable-query-defview whatsapp/contacts "📱 WhatsApp Contacts"
-  :prose "RET to message · h to heart · H to toggle hearted-only · d to send day greeting + snooze until Friday · f for a Friday funny."
+  :prose "RET to message · h to heart · H to toggle hearted-only · f to send day greeting + funny, snooze until Friday."
   :columns
-  `((:name "Name"
-           :width 30
+  `((:name "♥" :width 3 :align center
+           ;; Leftmost heart indicator: ❤️ for hearted contacts, faint · else.
+           ;; Width 3: the ❤️ emoji (heart + variation selector) renders ~2
+           ;; cells, so a width-2 column truncates it to an ellipsis.
+           :getter (lambda (o &rest _)
+                     (if (aq--heart-p whatsapp--contacts-view o)
+                         "❤️"
+                       (propertize "·" 'face '(:foreground "gray70")))))
+    (:name "Name"
+           :width 24
            :getter    (lambda (o &rest _) (or (plist-get o :name) ""))
            :formatter (lambda (v &rest _)
                         (propertize v 'face '(:foreground "deep sky blue" :weight bold))))
-    (:name "Phone"
-           :width 20
-           :getter    (lambda (o &rest _) (or (plist-get o :phone) ""))
+    (:name "Last message"  ; no :width -> auto-size to widest snippet
+           :getter    (lambda (o &rest _)
+                        (let ((s  (plist-get o :snippet))
+                              (ts (plist-get o :timestamp)))
+                          (cond
+                           ;; Real text from the last message.
+                           ((and s (not (string-empty-p s))) s)
+                           ;; A recent exchange exists but the last message had
+                           ;; no text (media/sticker/voice) --- note it + when.
+                           ((and ts (not (string-empty-p ts)))
+                            (format "🖼️ media · %s" (substring ts 0 10)))
+                           ;; No conversation yet --- fall back to the phone.
+                           (t (concat "☎ " (or (plist-get o :phone) ""))))))
            :displayer (lambda (v w _)
-                        (propertize (truncate-string-to-width v w)
+                        (propertize (truncate-string-to-width v w nil nil "…")
                                     'face '(:foreground "gray60")))))
   :objects  #'whatsapp--fetch-contacts
   :hearting t
@@ -233,23 +276,8 @@ The session is saved to whatsapp-session/ and all future calls are headless."
      ,(lambda (o)
         (kill-new (plist-get o :jid))
         (aq--message "Copied: %s" (plist-get o :jid))))
-    ("d" "Send day greeting + snooze until Friday"
-     ,(lambda (o)
-        (let* ((name (whatsapp--first-name (or (plist-get o :name) (plist-get o :phone) "?")))
-               (jid  (plist-get o :jid))
-               (msg  (whatsapp--day-message name))
-               (fri  (whatsapp--snooze-until-friday)))
-          (aq--message "Sending greeting to %s…" name)
-          (whatsapp--send-async jid msg
-            (lambda (result)
-              (when (plist-get result :ok)
-                (whatsapp--open-chat o)
-                (aq--dismiss-until whatsapp--contacts-view (aq--obj-id o) fri)
-                (when-let ((tbl (vtable-current-table)))
-                  (vtable-remove-object tbl o))
-                (aq--message "Sent & snoozed until Friday (%s)!" fri)))))))
-    ("f" "Send a funny for the day"
-     ,(lambda (o) (whatsapp--action-funny o)))))
+    ("f" "Send day greeting + funny, snooze until Friday"
+     ,(lambda (o) (whatsapp--action-funny o whatsapp--contacts-view)))))
 
 ;;; ─── View 2: Unread messages ─────────────────────────────────────────────────
 
@@ -260,11 +288,13 @@ Each object is a plist: :jid :name :phone :snippet :timestamp :count."
   (whatsapp--cli-async (whatsapp--node-argv "unread")
                        callback))
 
+(defconst whatsapp--unread-view "💬 WhatsApp Unread")
+
 (defun whatsapp--unread-prose ()
   "Header prose for the unread view."
-  "Unread WhatsApp messages — press RET to reply, 'd' to snooze, 'o' to open in app, 'f' for a funny.")
+  "Unread WhatsApp messages — press RET to reply, 'o' to open in app, 'f' for a day greeting + funny.")
 
-(actionable-query-defview whatsapp/unread "💬 WhatsApp Unread"
+(actionable-query-defview whatsapp/unread whatsapp--unread-view
   :prose (whatsapp--unread-prose)
   :columns
   `((:name "From"
@@ -313,8 +343,8 @@ Each object is a plist: :jid :name :phone :snippet :timestamp :count."
      ,(lambda (o)
         (kill-new (or (plist-get o :snippet) ""))
         (aq--message "Copied: %s" (plist-get o :snippet))))
-    ("f" "Send a funny for the day"
-     ,(lambda (o) (whatsapp--action-funny o)))))
+    ("f" "Send day greeting + funny, snooze until Friday"
+     ,(lambda (o) (whatsapp--action-funny o whatsapp--unread-view)))))
 
 (provide 'whats-app)
 ;;; whats-app.el ends here

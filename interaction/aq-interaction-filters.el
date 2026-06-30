@@ -37,16 +37,36 @@
 (defvar-local aq--active-filters nil
   "Alist of (column-name . regex) for active column filters.")
 
+(defvar-local aq--editable-setters nil
+  "Alist of (column-index . setter-fn) populated by `aq--coerce-columns'.
+Keyed by index, not name --- column `:name' is cosmetic and several
+columns may share one (e.g. multiple blank \"\" labels in a one-line
+layout), so name would silently clobber entries for distinct columns.
+SETTER-FN is `(lambda (object new-value) …)', called by
+`aq--edit-current-cell' when the column is `:editable'.")
+
 (defvar-local aq--all-objects nil
   "Full unfiltered object list from the last async delivery; used by column filters.")
 
 (defun aq--coerce-columns (cols)
-  "Coerce COLS (strings, plists, or vtable-column structs) to vtable-column objects."
-  (mapcar (lambda (col)
-            (cond ((stringp col) (make-vtable-column :name col))
-                  ((listp col)   (apply #'make-vtable-column col))
-                  (t col)))
-          cols))
+  "Coerce COLS (strings, plists, or vtable-column structs) to vtable-column objects.
+Plists may carry `:editable' and `:setter' — `vtable-column' has no such
+slots, so they're stripped here before `make-vtable-column' and recorded
+in `aq--editable-setters' (keyed by column index) for `aq--edit-current-cell'."
+  (cl-loop for col in cols
+           for idx from 0
+           collect
+           (cond ((stringp col) (make-vtable-column :name col))
+                 ((listp col)
+                  (let* ((editable (plist-get col :editable))
+                         (setter   (plist-get col :setter))
+                         (clean    (cl-loop for (k v) on col by #'cddr
+                                            unless (memq k '(:editable :setter))
+                                            append (list k v))))
+                    (when editable
+                      (setf (alist-get idx aq--editable-setters nil nil #'eql) setter))
+                    (apply #'make-vtable-column clean)))
+                 (t col))))
 
 (defun aq--apply-filters (objects filters columns)
   "Return OBJECTS filtered by FILTERS, an alist of (column-name . regex).

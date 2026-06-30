@@ -37,11 +37,24 @@
 (require 'aq-interaction-popup)        ; `aq--current-row'
 (require 'aq-interaction-help-echo)    ; `aq--center-message', `aq--last-help-echo-obj'
 (require 'aq-interaction-keys)         ; `aq--region-keymap', `aq--actions->region-keymap', `aq--install-host-action-keys'
-(require 'inline-spinner)              ; ⏳ placeholder helpers — `aq--insert-pending-placeholder' &c.
+(require 'aq-interaction-edit)         ; `aq--edit-current-cell-1'
+(require 'point-async)                 ; generic ⏳ slot primitive
+(require 'aq-state-dismissal)          ; `aq--post-deliver-hook', heart helpers, `aq--undismiss-all'
 
 (declare-function vtable-current-object         "vtable")
+(declare-function vtable-current-table          "vtable")
+(declare-function vtable-objects                "vtable")
+(declare-function vtable-remove-object          "vtable")
 (declare-function vtable-sort-by-current-column "vtable")
 (declare-function aq--filter-prompt-and-apply   "aq-interaction-filters")
+(declare-function aq--edit-current-cell-1       "aq-interaction-edit")
+(declare-function aq--toggle-heart              "aq-state-dismissal")
+(declare-function aq--heart-p                   "aq-state-dismissal")
+(declare-function aq--undismiss-all             "aq-state-dismissal")
+(declare-function aq--obj-id                    "actionable-query")
+(declare-function aq--obj-label                 "aq-state-cache")
+(declare-function aq--install-host-standard-keys "aq-interaction-keys")
+(defvar aq--editable-setters)          ; defvar-local in aq-interaction-filters
 
 ;;; ─── per-region dispatch commands ────────────────────────────────────────────
 ;;
@@ -110,6 +123,64 @@ returned."
   "Move row at point down.  Bound to `M-<down>' inside a splice region."
   (interactive)
   (aq--move-row  1))
+
+(defun aq-region-edit-cell ()
+  "Edit the cell at point in the spliced view under point.  Bound to `e'.
+Reads the region's editable setters from its `aq-region-ctx' --- the
+buffer-local `aq--editable-setters' the dedicated buffer relies on is
+absent in a host buffer."
+  (interactive)
+  (if-let ((ctx (aq--ctx-at-point)))
+      (aq--edit-current-cell-1 (aq-region-ctx-editable-setters ctx))
+    (user-error "Not inside a spliced view")))
+
+(defun aq-region-toggle-heart ()
+  "Toggle the heart on the row at point, scoped to this region's view.  Bound to `h'.
+When the region is showing hearted-only and the row is un-hearted, drop it
+from the live table; otherwise re-render so a freshly-hearted row appears
+under an active filter."
+  (interactive)
+  (if-let ((ctx (aq--ctx-at-point)))
+      (when-let ((o (vtable-current-object)))
+        (let ((now (aq--toggle-heart (aq-region-ctx-view-name ctx) o)))
+          (aq--message "%s %s" (if now "❤️  Hearted:" "🩶 Un-hearted:") (aq--obj-label o))
+          (if (and (aq-region-ctx-show-hearted-only ctx) (not now))
+              (vtable-remove-object (vtable-current-table) o)
+            (when (aq-region-ctx-show-hearted-only ctx)
+              (aq--rerender-region ctx)))))
+    (user-error "Not inside a spliced view")))
+
+(defun aq-region-toggle-hearted-only ()
+  "Toggle showing only hearted rows in this region.  Bound to `H'.
+Filtering on prunes non-hearted rows from the live table in place;
+filtering off re-renders the region to restore the full row set (the host
+buffer keeps no separate all-objects store the way a dedicated view does)."
+  (interactive)
+  (if-let ((ctx (aq--ctx-at-point)))
+      (let ((on (not (aq-region-ctx-show-hearted-only ctx)))
+            (view (aq-region-ctx-view-name ctx)))
+        (setf (aq-region-ctx-show-hearted-only ctx) on)
+        (if (not on)
+            (aq--rerender-region ctx)        ; rebuild the full set
+          (let ((table (vtable-current-table)))
+            (dolist (o (copy-sequence (vtable-objects table)))
+              (unless (aq--heart-p view o)
+                (vtable-remove-object table o)))))
+        (aq--message "%s" (if on "❤️  Showing hearted only --- H to show all"
+                            "Showing all rows")))
+    (user-error "Not inside a spliced view")))
+
+(defun aq-region-resurrect ()
+  "Un-snooze this region's view and re-render the region in place.  Bound to `R'.
+The view's own resurrect closure targets its dedicated buffer, so we instead
+un-dismiss by view name and re-run the splice path (as `g' does)."
+  (interactive)
+  (if-let ((ctx (aq--ctx-at-point)))
+      (progn
+        (aq--undismiss-all (aq-region-ctx-view-name ctx))
+        (aq--rerender-region ctx)
+        (aq--message "Snoozed items resurrected."))
+    (user-error "Not inside a spliced view")))
 
 ;;; ─── host-buffer hook installers ────────────────────────────────────────────
 
@@ -227,36 +298,62 @@ source order rather than collapsing in reverse."
         (insert content)
         (setq end (copy-marker (point) t))
         (when view-name
+          ;; Carry the view buffer's editable setters onto the ctx so `e'
+          ;; (via `aq-region-edit-cell') can edit cells in the host buffer,
+          ;; where that buffer-local would otherwise be absent.
           (let ((ctx (make-aq-region-ctx
-                      :view-name    view-name
-                      :begin        begin
-                      :end          end
-                      :actions      actions
-                      :help-echo-fn help-echo-fn
-                      :async-fn     async-fn)))
+                      :view-name        view-name
+                      :begin            begin
+                      :end              end
+                      :actions          actions
+                      :help-echo-fn     help-echo-fn
+                      :async-fn         async-fn
+                      :editable-setters (buffer-local-value 'aq--editable-setters src-buf))))
             (put-text-property begin end 'aq--region-ctx ctx))))
       (when help-echo-fn
         (aq--install-host-help-echo))
+      ;; Standard region keys (g/=/e/t/h/…) ride a buffer-local override map
+      ;; --- fontification-proof, unlike the `keymap' text-property which
+      ;; org-mode strips on the first redisplay.
+      (when view-name
+        (aq--install-host-standard-keys))
       (when (and view-name actions)
         (aq--install-host-action-keys actions)))))
 
-(cl-defun aq--insert-view-on-deliver (view-buf target-buf pos
-                                               &key help-echo-fn view-name actions async-fn)
-  "After the next async delivery into VIEW-BUF, splice its content into TARGET-BUF at POS.
-Uses a one-shot entry in `aq--post-deliver-hook' so it fires exactly once.
+(cl-defun aq--insert-view-async (view-buf &key help-echo-fn view-name actions async-fn)
+  "Reserve a slot in the current buffer; fill it when VIEW-BUF delivers.
+
+Composes the generic `point-async' primitive with actionable-query's
+post-deliver-hook plumbing.  Reserves a slot at point in the host
+buffer, then pushes a one-shot onto `aq--post-deliver-hook' (in
+VIEW-BUF) that, when fired, resolves the slot and splices the
+rendered VIEW-BUF content with full region-ctx for
+`g'/`='/`m'/etc..
+
+Cached-deliver path works automatically: when `(funcall deliver
+cached)' fires inside the same call frame, the hook runs
+synchronously inside the surrounding render call, so the resolve
+happens before the macro returns and the inserted vtable is
+already present when the caller's next `(insert ...)' lands.
+
 HELP-ECHO-FN, VIEW-NAME, ACTIONS, ASYNC-FN are forwarded to
-`aq--splice-view-into' — together they let the spliced region carry a
-full `aq-region-ctx' for `g'/`='/`m'/etc."
-  (with-current-buffer view-buf
-    (letrec ((hook (lambda ()
-                     (aq--splice-view-into view-buf target-buf pos
-                                           :help-echo-fn help-echo-fn
-                                           :view-name    view-name
-                                           :actions      actions
-                                           :async-fn     async-fn)
-                     (setq aq--post-deliver-hook
-                           (delq hook aq--post-deliver-hook)))))
-      (push hook aq--post-deliver-hook))))
+`aq--splice-view-into'."
+  (let ((here (point-async-reserve
+               :label (format "fetching %s…" (or view-name "view")))))
+    (with-current-buffer view-buf
+      (letrec ((hook (lambda ()
+                       ;; Resolve clears the placeholder and parks
+                       ;; point at the slot in the host buffer.
+                       (point-async-resolve here)
+                       (aq--splice-view-into
+                        view-buf (current-buffer) (point)
+                        :help-echo-fn help-echo-fn
+                        :view-name    view-name
+                        :actions      actions
+                        :async-fn     async-fn)
+                       (setq aq--post-deliver-hook
+                             (delq hook aq--post-deliver-hook)))))
+        (push hook aq--post-deliver-hook)))))
 
 (provide 'aq-render-splice)
 ;;; aq-render-splice.el ends here

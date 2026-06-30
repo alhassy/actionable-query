@@ -1,0 +1,408 @@
+#+title: point-async ---reserve a point for async insertion
+#+author: Musa Al-hassy
+
+* What & why
+
+A composition primitive for buffers that interleave plain prose with
+content whose value arrives later.  The motivating shape:
+
+#+begin_src emacs-lisp
+(insert "Before")
+(let ((here (point-async-reserve)))
+  (run-with-timer 0.5 nil
+                  (lambda ()
+                    (point-async-resolve here)
+                    (insert "NICE"))))
+(insert "After")
+#+end_src
+
+While the slot is in flight the buffer reads
+
+#+begin_example
+Before ⏳ After
+#+end_example
+
+and once we resolve and ~(insert "NICE")~ it reads
+
+#+begin_example
+Before NICE After
+#+end_example
+
+---regardless of whether the resolve happens synchronously inside the
+same form or hours later from a process filter.
+
+The key invariant: subsequent ~(insert "After")~ composes at the
+right spot in source order even when the slot is still pending.
+Each reserve call owns its own marker pair, so interleaved
+resolutions of multiple slots stay in their respective slots ---the
+prose-then-table-then-prose-then-table layout that breaks when you
+naively ~(insert (do-async))~ because async resolutions race the
+prose and clump at the end.
+
+* API surface
+
+Three user-facing functions:
+
+#+begin_src emacs-lisp
+(point-async-reserve &key label deadline) ⇒ HERE
+(point-async-resolve HERE)
+(point-async-fail    HERE REASON)
+#+end_src
+
+~point-async-reserve~ synchronously paints a ⏳-animated placeholder
+at point in the current buffer, advances point past it like
+~(insert ...)~, and returns an opaque handle ~HERE~ that the caller
+stashes for later.
+
+~point-async-resolve~ cancels the spinner, deletes the placeholder
+span, and parks point at the cleared slot in ~HERE~'s host buffer.
+Whatever the caller runs next executes at that point ---a single
+~(insert "NICE")~, a multi-line splice with text-properties, a
+vtable render, all from a known point-position contract.
+
+~point-async-fail~ replaces the slot with a ⚠️ note explaining
+~REASON~.  If nothing resolves or fails the slot, the deadline timer
+trips after ~point-async-deadline-seconds~ (default 300s) and the
+slot self-fails.
+
+* Concretely
+
+** Synchronous case ---data already on hand
+
+#+begin_src emacs-lisp
+(insert "Before")
+(let ((here (point-async-reserve)))
+  (point-async-resolve here)
+  (insert "NICE"))
+(insert "After")
+
+;; ⇒ buffer reads "BeforeNICEAfter".
+;; ⏳ never paints visibly to the user.
+#+end_src
+
+The placeholder is painted, immediately cleared, the user inserts
+their content ---all before the surrounding form returns.
+
+** Asynchronous case ---resolve returns later
+
+#+begin_src emacs-lisp
+(insert "Before")
+(let ((here (point-async-reserve)))
+  (run-with-timer 0.5 nil
+                  (lambda ()
+                    (point-async-resolve here)
+                    (insert "NICE"))))
+(insert "After")
+
+;; t=0:    buffer is "Before⏳After", point past "After".
+;; t=0.5s: buffer is "BeforeNICEAfter".
+#+end_src
+
+Subsequent ~(insert "After")~ runs while the placeholder is still
+animating; when the timer fires, the placeholder is replaced in
+place and "After" is unaffected.
+
+* Analogies in the Emacs API
+
+~point-async-*~ deliberately leans on existing Emacs vocabulary.
+The kinships are real but partial ---worth seeing the table once,
+then forgetting it:
+
+| Emacs concept              | Kinship with ~point-async-*~                                   | Where the analogy breaks                                              |
+|----------------------------+----------------------------------------------------------------+-----------------------------------------------------------------------|
+| ~(point)~                  | "the location we care about"                                   | ~(point)~ returns an integer that goes stale; ~HERE~ is a live handle |
+| ~(point-min)~/~(point-max)~ | "named, distinguished positions"                               | ~point-min~ etc. are buffer-derived; ~HERE~ is created on demand      |
+| markers                    | implementation detail ---~HERE~ wraps a marker pair internally | a marker is bare; ~HERE~ also carries spinner + timers + state        |
+| ~save-excursion~           | "save a position now, return to it later"                      | ~save-excursion~ restores point unconditionally and is a scope; ~point-async-resolve~ parks point at the saved location and is asynchronous |
+
+The closest single-sentence summary: ~point-async-reserve~ is a
+*deferred* ~save-excursion~ ---it saves the current location *and
+makes the location visible* (via the ⏳ spinner), then waits for
+explicit resolve rather than restoring on body exit.
+
+* A short detour: lexical vs dynamic binding
+
+Skip this section if you already know it ---it's groundwork for the
+design discussion that follows, *not* an insert-async concept.  No
+~point-async-*~ here on purpose.
+
+** The pop quiz
+
+What does this print?
+
+#+begin_src emacs-lisp
+(let ((x 1))                          ; ← x is bound to 1
+  (run-with-timer 0.5 nil             ; ← schedule a callback for later
+                  (lambda ()
+                    (message "x is %s" x)))) ; ← we try to read x here, half a second from now
+;; ← the `let' has exited; x's binding is gone if dynamic
+;; ← ...timer hasn't fired yet...
+;; t = 0.5s: timer fires, runs the lambda
+#+end_src
+
+Answer: it depends on the buffer's binding mode.
+
+- In a buffer with ~lexical-binding: t~ at the top: prints
+  ~x is 1~.  The lambda *captured* the value of ~x~ when it was
+  created (a snapshot, baked into the closure object), and pulls it
+  back out half a second later when the timer fires ---the long-since
+  exited ~let~ doesn't matter.
+
+- In a buffer with ~lexical-binding: nil~ (the default of
+  ~*scratch*~ and ~M-:~ buffers!): the timer fires, looks up ~x~
+  *at that moment*, finds nothing (the ~let~ exited 0.5 seconds ago,
+  so ~x~ has no current binding ---the variable is, effectively,
+  garbage-collected), and signals ~(void-variable x)~.
+
+That's the entire difference ---ELI5:
+
+| Mode      | When the lambda needs ~x~, it...                                    |
+|-----------+---------------------------------------------------------------------|
+| Lexical   | uses the snapshot it took when it was *born*                        |
+| Dynamic   | looks up whatever ~x~ is *right now* in the running program         |
+
+** Why dynamic binding is the default
+
+Historical reasons.  Emacs Lisp was dynamic-only for decades; lexical
+binding was bolted on in Emacs 24 (2012) behind a file-level cookie
+~;;; -*- lexical-binding: t; -*-~ to keep old code working.  Every
+new ~.el~ file should set the cookie; ad-hoc evaluation buffers
+(~*scratch*~, ~M-:~) still default to dynamic.
+
+** Why we usually want lexical
+
+Closures.  Anything that schedules a callback for later ---a timer, a
+process filter, a network sentinel--- captures variables.  Under
+dynamic binding, those captures don't survive the ~let~ that bound
+them, so the callback fires into the void.
+
+** When dynamic binding is fine
+
+Top-level ~setq~ on global state.  Quick experiments at ~M-:~.
+Macros that explicitly want late-bound names (e.g.
+~with-current-buffer~ binds ~standard-output~ dynamically on
+purpose).  In short: when you *want* late lookup, dynamic is the
+right tool.  The trouble is that dynamic is the *default*, so
+people get it without asking.
+
+** The backtick-splice escape hatch
+
+You can rescue the broken example without changing the buffer's
+binding mode, by *baking the value into the code* at read time:
+
+#+begin_src emacs-lisp
+(let ((x 1))                          ; ← x is bound to 1
+  (run-with-timer 0.5 nil
+                  `(lambda ()                       ; ← backtick: read-time template
+                     (message "x is %s" ,x))))      ; ← ,x: substitute the literal 1 NOW
+;; the lambda the timer holds is literally:
+;;   (lambda () (message "x is %s" 1))   ← no x reference left at all
+#+end_src
+
+The backtick + ~,x~ tells the reader: "before this lambda becomes a
+lambda, substitute the literal value of ~x~ here."  By the time the
+timer fires, the lambda's body has no free variable to look up, so
+dynamic binding has nothing to fail on.
+
+This trick works, but it's stylistically ugly: the lambda you read
+in the source isn't the lambda that runs.  Most codebases prefer to
+just turn lexical binding on and move on.
+
+* Why slot-passing instead of CPS / Promises?
+
+If you've squinted at the API and thought "this looks like a
+JS Promise turned inside out," you're right ---it's a deliberate
+divergence.  Worth the discussion.
+
+** The Promise / CPS shape
+
+The Continuation Passing Style version of this primitive looks like:
+
+#+begin_src emacs-lisp
+;; Hypothetical CPS API ---NOT what we have.
+(insert "Before")
+(insert-async
+ (lambda (resolve)
+   (run-with-timer 0.5 nil
+                   (lambda ()
+                     (funcall resolve (lambda () (insert "NICE")))))))
+(insert "After")
+#+end_src
+
+The producer is a 1-arg function; ~resolve~ is its continuation;
+when the producer is ready it ~(funcall resolve thunk)~.  Identical
+in shape to:
+
+#+begin_src js
+new Promise((resolve, _reject) => {
+  setTimeout(() => resolve("NICE"), 500);
+});
+#+end_src
+
+That's the JS Promise constructor.  Same control-flow.
+
+** Why it sounds great...
+
+- Uniform: every async operation has the same shape.
+- Composable: chain ~.then~, ~.catch~, etc.  (We never used those.)
+- Familiar: anyone who's written modern JS reads it in their sleep.
+
+** ...and the foot-gun that buried it for us
+
+The producer's inner lambda *closes over* ~resolve~.  In a
+dynamically-bound buffer, that closure is broken: when the timer
+fires, the deferred lambda looks up ~resolve~ at the global level
+and finds nothing.  ~(void-variable resolve)~.  A user copy-pasting
+our README example into ~*scratch*~ hits this within thirty seconds
+of trying anything async.
+
+The escape hatches all have costs.  Concretely, the broken example
+under dynamic binding ---continuing the timer-and-~x~ thread from the
+detour above:
+
+#+begin_src emacs-lisp
+;; Buffer is in dynamic binding.
+(let ((x 1))                          ; ← x is bound to 1
+  (run-with-timer 0.5 nil
+                  (lambda ()
+                    (message "x is %s" x)))) ; ← we'll try to read x later
+;; ← `let' has exited; under dynamic binding x's binding is gone
+;; t = 0.5s: timer fires
+;;   ← the lambda tries to look up x and finds nothing
+;;   ⇒ Symbol's value as variable is void: x
+#+end_src
+
+Three known patches, in order of ascending cleanliness:
+
+1. *Backtick-splice* ---bake the value into the lambda at read time:
+
+   #+begin_src emacs-lisp
+   (let ((x 1))                       ; ← x is bound to 1
+     (run-with-timer 0.5 nil
+                     `(lambda ()                ; ← backtick template
+                        (message "x is %s" ,x)))) ; ← ,x is replaced with 1 NOW
+   ;; the lambda the timer holds: (lambda () (message "x is %s" 1))
+   ;; ← no x reference left, so dynamic binding has nothing to fail on
+   #+end_src
+
+   Works.  But the lambda you read in source isn't the lambda that
+   runs, and you have to splice every captured variable by hand.
+
+2. *~lexical-let~ from ~cl~* ---a macro that *manually rewrites* its
+   body so that variables it binds are captured by closure cells
+   regardless of the surrounding binding mode:
+
+   #+begin_src emacs-lisp
+   (require 'cl)                      ; ← old cl, not cl-lib
+   (lexical-let ((x 1))               ; ← x is bound, with closure-cell semantics
+     (run-with-timer 0.5 nil
+                     (lambda ()
+                       (message "x is %s" x)))) ; ← captures x's CELL, not its value-now
+   ;; ← `lexical-let' exits, but x's cell is kept alive by the closure
+   ;; t = 0.5s: timer fires, lambda reads x's cell ⇒ "x is 1"
+   #+end_src
+
+   Reads naturally and works in any buffer.  Catches:
+   *officially obsolete since Emacs 24.3* (the docstring tells you
+   to use file-level ~lexical-binding: t~ instead), it only fixes
+   captures of variables ~lexical-let~ itself binds (a free ~y~
+   inside the lambda would still break), and it lives in the older
+   ~cl~ package most modern Elisp avoids.
+
+3. *File-level ~;;; -*- lexical-binding: t; -*-~* ---put the cookie
+   at the top of the ~.el~ file and the original code Just Works.
+   This is the right answer for code you save in a file, but it
+   does nothing for ~*scratch*~ or ~M-:~ where the buffer's binding
+   mode is whatever Emacs decided at startup.
+
+A *fourth* option we considered for ~point-async~ specifically: a
+runtime ~(unless lexical-binding (warn "..."))~ at the top of the
+producer-style API.  Honest but doesn't actually fix the
+ergonomics ---it just makes the error message friendlier.
+
+We tried each.  None felt right.
+
+** What slot-passing buys us
+
+Returning ~HERE~ as a *value* and exposing ~point-async-resolve~ as
+a *function the caller calls later* eliminates the closure entirely.
+The user's deferred lambda doesn't need to capture anything ---it
+just calls a globally-known function with a globally-known value.
+Works identically under lexical and dynamic binding because there's
+nothing to capture in the first place.
+
+| Concern                          | CPS / Promise version | Slot-passing version |
+|----------------------------------+-----------------------+----------------------|
+| Familiar shape                   | ✓                     | ~                    |
+| Composable .then chains          | ✓                     | (we never wanted them) |
+| Works in dynamic-binding buffers | ✗                     | ✓                    |
+| Source-order invariant           | ✓                     | ✓                    |
+| Failure path                     | reject(err)           | ~point-async-fail~   |
+| API surface                      | 1 fn                  | 3 fns                |
+
+The trade is: we gave up Promise familiarity and gained a primitive
+that always works.  For an Emacs library that has to coexist with
+~*scratch*~ and ~M-:~ and twenty years of dynamic-binding muscle
+memory, that's the right trade.
+
+* Failure mode
+
+Yes, every reservation has an automatic deadline.  If the slot is
+never resolved or failed, the deadline timer (armed by
+~point-async-reserve~ itself) trips after
+~point-async-deadline-seconds~ (default 300s) and the slot is
+replaced with a ⚠️ note ---no caller bookkeeping required.  Tune
+the customisation if your async sources legitimately take longer;
+the default is sized for slow network fetches.
+
+#+begin_src emacs-lisp
+;; Reserve with a tight 5-second deadline; never resolve.
+(insert "Before")
+(point-async-reserve :label "fetching foo…" :deadline 5)
+(insert "After")
+;; t = 0:  buffer is "Before⏳ fetching foo…\nAfter"
+;; t = 5:  the slot self-fails:
+;;         "Before⚠️ point-async failed: 5.0s deadline hit.\nAfter"
+#+end_src
+
+You can also ~point-async-fail~ explicitly ---e.g. from a process
+sentinel that detects an error before any output arrived:
+
+#+begin_src emacs-lisp
+(let ((here (point-async-reserve)))
+  ;; ...kick off async work...
+  (when (network-failed-p)            ; ← detected mid-flight
+    (point-async-fail here "network unreachable")))
+#+end_src
+
+Both paths are idempotent: a slot that has already resolved (or
+failed) ignores subsequent ~resolve~/~fail~ calls, so a late deadline
+trip after a successful resolve is a harmless no-op.
+
+* Dependencies
+
+This file is intentionally standalone ---no dependency on any
+particular UI framework.  The only external dep is [[https://github.com/Malabarba/spinner.el][spinner.el]]
+(mode-line spinner library, MELPA).
+
+* Tests
+
+Run all tests in batch from this directory:
+
+#+begin_src bash
+cd ~/actionable-query/point-async
+emacs --batch -L . -L ~/snap \
+      --eval '(package-initialize)' \
+      -l point-async-tests.el -f ert-run-tests-batch-and-exit
+#+end_src
+
+Or interactively: =M-x ert= after loading the file.
+
+The test file covers:
+- placeholder visible synchronously,
+- resolve clears placeholder and parks point at the slot,
+- out-of-order resolution preserves source order,
+- prose interleaves correctly when resolves are synchronous,
+- explicit fail replaces slot with ⚠️ note,
+- truly async resolve via ~run-with-timer~ works correctly, and
+- deadline trips when slot is never resolved.

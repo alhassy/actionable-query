@@ -2,25 +2,6 @@
 #+author: Musa Al-hassy
 #+options: toc:2
 
-* TODOs
-
- I defined
-
-   (actionable-query-defview my/first-view0 
-                          "My first view"
-                          :objects '("one" "two" "three")
-                          :actions '(("RET" "Print it" (lambda (it) (message-box "You picked: %s" it))))
-                          :help-echo (lambda (it) (format "Row value: %s" it)))
-
-   Then, I invoked
-
-   (my/first-view0 :insert t)
-
-   Then the RET action behaves as expected in fundamental-mode,
-   but in oRg-mode, RET just insets a neline. 
-
-   All :actions should be active on the table in its region.
-
 * async notes -- useful for newcomerss!
 
  ;;; ─── async object loading ───────────────────────────────────────────────────
@@ -176,6 +157,63 @@ Dependencies: =org-ql= (MELPA), =vtable= (built into Emacs 29+),
 ~agenda.el~ and ~actionable-query-scheduler.el~ are loaded automatically
 by the main file.
 
+** Startup behavior: views registered silently, opened on demand
+
+Evaluating an ~actionable-query-defview~ form does two things:
+
+1. *Registers* the view in ~org-ql-views~ (so ~M-x org-ql-view~ finds it).
+2. *Opens* the view buffer ---but only when evaluated interactively.
+
+The key variable is ~aq-defview-open-on-define~, whose default is
+~'auto~.  Under ~'auto~, the library checks ~load-file-name~ at expansion
+time:
+
+- ~nil~ ---form evaluated interactively via ~C-x C-e~, ~ielm~, or ~M-:~---
+  → buffer opens immediately.  This is the "see what you just
+  defined" ergonomic that makes iterative development fast.
+
+- Non-nil ---file being loaded via ~load-file~, ~require~, or
+  ~org-babel-load-file~--- → view is registered silently.  No
+  unsolicited buffers on startup.
+
+You never need to set this variable yourself.  The behavior is
+correct by default: define a view and press ~C-x C-e~ to see it; load
+a file of views at startup and they are quietly available via
+~M-x org-ql-view~ or their named command.
+
+*** If you want the old "always open" behavior
+
+Set the variable to ~t~ before loading your view files:
+
+#+begin_src emacs-lisp
+(setq aq-defview-open-on-define t)
+(load-file "~/my-views.el")
+#+end_src
+
+This is equivalent to the pre-~'auto~ behavior and is useful if you
+actively want Emacs to open a specific dashboard on every startup
+---say, a Morning Standup view that you read the moment Emacs loads.
+
+*** If you use ~desktop-save-mode~
+
+~desktop-save-mode~ can restore ~*Org QL View*~ buffers from a
+previous session.  Since each view's ~:objects~ thunk re-fires on
+open (via ~g~ or by calling the view function), this means your
+queries run automatically on every Emacs restart ---which may or may
+not be desirable.
+
+To opt out, add the ~*Org QL View*~ buffer name pattern to
+~desktop-clear-preserve-buffers~ or exclude it from restoration:
+
+#+begin_src emacs-lisp
+(add-to-list 'desktop-clear-preserve-buffers-regexp
+             (regexp-quote "*Org QL View"))
+#+end_src
+
+To opt in deliberately (run all your queries fresh on restart), just
+leave ~desktop-save-mode~ as-is; the view buffers will be restored
+and their data refreshed.
+
 * Hello, world
 
 Maybe start with super simple:
@@ -295,6 +333,204 @@ the header text and cell values within the column width:
 #+end_src
 
 ~Item~ headers and cells are centered; omitting ~:align~ defaults to left.
+
+*** Editable cells
+
+Pass ~:editable t~ plus a ~:setter~ on any column plist to let the user
+edit that cell in place.  ~e~ prompts with the cell's current value
+pre-filled, calls ~:setter~ with the row object and the new string, and
+reverts the table so every row gets a chance to repaint — not just the
+edited one (see below for why that matters).  The cell under point
+gets a distinct face (~aq-editable-cell-face~) the moment point lands
+on an editable column, so it is visually obvious which cells respond
+to ~e~ before pressing anything:
+
+Editing always goes through the minibuffer prompt — there is no
+inline, type-directly-into-the-buffer mode.  Cell text doubles as a
+vtable column, and columns carry their own keybindings (sorting via
+~S~, narrowing/widening, click-to-sort on the header, ~=~ for column
+filtering).  Making cell text itself locally writable would mean
+suspending or shadowing all of that, just for the one column being
+edited — not worth it for a feature whose job is reading a new value,
+not replacing vtable's own column interactions.
+
+#+begin_src emacs-lisp
+(actionable-query-defview igo "Temperature Converter"
+  ;; Each row keeps a pointer to its sibling, so the `:setter' below can
+  ;; reach "the other one" without needing the whole objects list.  Built
+  ;; inside `:objects' itself --- not in an outer `let' --- so this works
+  ;; under dynamic binding too: `actionable-query-defview' defers opening
+  ;; the buffer, and a `let'-bound `celsius'/`fahrenheit' referenced from
+  ;; outside this form would already be unbound by the time it runs.
+  :objects (let* ((celsius    (list :label "Celsius"    :value "31"   :unit "°C"))
+                  (fahrenheit (list :label "Fahrenheit" :value "87.8" :unit "°F")))
+             (plist-put celsius    :sibling fahrenheit)
+             (plist-put fahrenheit :sibling celsius)
+             (list celsius fahrenheit))
+  :columns
+  '((:name "" :width 12 :getter (lambda (o &rest _) (plist-get o :label)))
+    (:name "Value" :width 8 :align 'right
+           :editable t
+           :getter (lambda (o &rest _) (plist-get o :value))
+           :setter (lambda (o new-value)
+                     (unless (string-match-p "\\`-?[0-9]+\\.?[0-9]*\\'" new-value)
+                       (user-error "Temperature must be a number, got %S" new-value))
+                     (let ((n       (string-to-number new-value))
+                           (sibling (plist-get o :sibling)))
+                       (plist-put o :value new-value)
+                       (plist-put sibling :value
+                                  (format "%d"
+                                          (round
+                                           (if (string= (plist-get o :label) "Celsius")
+                                               (+ (* n 9.0 (/ 1.0 5)) 32)
+                                             (* (- n 32) 5.0 (/ 1.0 9)))))))))
+    (:name "" :width 4 :getter (lambda (o &rest _) (plist-get o :unit))))
+  :prose-bottom (insert (propertize "Hot! Stay hydrated!" 'face 'success)))
+#+end_src
+
+Editing Celsius's ~Value~ to ~100~ auto-updates Fahrenheit to ~212~, and
+vice versa — the ~:setter~ mutates both the edited row and its sibling
+in one pass.  This is also why ~e~ reverts the whole table rather than
+calling ~vtable-update-object~ on just the edited row: a ~:setter~ free
+to touch sibling rows needs every row repainted, not only the one
+under point.
+
+Columns without ~:editable~ are untouched — pressing ~e~ on the Label
+column above signals a clear ~user-error~ rather than silently no-oping.
+~:getter~ stays read-only as before; ~:setter~ is the only new surface,
+so the column spec doubles as the inverse-function contract: ~vtable~
+has no way to infer how to write a value back into an arbitrary object,
+so the call site supplies it explicitly.
+
+*** Reacting to the new value: updating ~:prose-bottom~ on edit
+
+A ~:setter~ can do more than write the cell back — it can react to
+the new value and update other parts of the buffer.  Here, editing
+either temperature also picks a weather message for the Celsius
+reading and rewrites the prose line below the table.
+
+This is the point of /actionable/ queries: the table does not just
+display a fact, it tells the user what to do about it — "Cold, wear
+a jacket" rather than a bare number left for the user to interpret
+themselves.  A row that only shows data is a report; a row that also
+hands back a reaction is what this package is named after:
+
+#+begin_src emacs-lisp
+(defun my/weather-message (celsius)
+  (cond
+   ((< celsius 0)  "Behold, the frost descends upon the land; clothe thyself well.")
+   ((< celsius 10) "A chill prevails; let a jacket be thy companion.")
+   ((< celsius 20) "Mild and temperate is this hour; go forth in peace.")
+   ((< celsius 30) "The sun smiles gently upon thee; rejoice in this fair day.")
+   (t              "Great heat besets the land; drink water, and tarry not in the sun.")))
+
+(actionable-query-defview "Temperature Converter"
+  :objects (let* ((celsius    (list :label "Celsius"    :value "31"   :unit "°C"))
+                  (fahrenheit (list :label "Fahrenheit" :value "87.8" :unit "°F")))
+             (plist-put celsius    :sibling fahrenheit)
+             (plist-put fahrenheit :sibling celsius)
+             (list celsius fahrenheit))
+  :columns
+  `((:name "" :width 12 :getter (lambda (o &rest _) (plist-get o :label)))
+    (:name "Value" :width 8 :align 'right
+           :editable t
+           :getter (lambda (o &rest _) (plist-get o :value))
+           :setter (lambda (o new-value)
+                     (unless (string-match-p "\\`-?[0-9]+\\.?[0-9]*\\'" new-value)
+                       (user-error "Temperature must be a number, got %S" new-value))
+                     (let* ((n       (string-to-number new-value))
+                            (sibling (plist-get o :sibling))
+                            (celsius (if (string= (plist-get o :label) "Celsius")
+                                         n
+                                       (* (- n 32) 5.0 (/ 1.0 9)))))
+                       (plist-put o :value new-value)
+                       (plist-put sibling :value
+                                  (format "%d"
+                                          (round
+                                           (if (string= (plist-get o :label) "Celsius")
+                                               (+ (* n 9.0 (/ 1.0 5)) 32)
+                                             celsius))))
+                       ;; Found via its `my-weather-message' text property,
+                       ;; not by searching for the old wording, so this
+                       ;; works regardless of what the message used to say.
+                       ;; `save-excursion' matters: without it, point ends
+                       ;; up parked in the prose region, and the
+                       ;; `vtable-revert' that runs right after this
+                       ;; setter returns can no longer find the table.
+                       (save-excursion
+                         (when-let ((match (text-property-search-forward
+                                            'my-weather-message nil nil)))
+                           (let ((inhibit-read-only t))
+                             (delete-region (prop-match-beginning match)
+                                            (prop-match-end match))
+                             (goto-char (prop-match-beginning match))
+                             (insert (propertize (my/weather-message celsius)
+                                                  'face 'success
+                                                  'my-weather-message t))))))))
+    (:name "" :width 4 :getter (lambda (o &rest _) (plist-get o :unit))))
+  :prose-bottom (insert (propertize (my/weather-message 31)
+                                     'face 'success
+                                     'my-weather-message t)))
+#+end_src
+
+Editing Celsius to ~-5~ swaps the message to "Behold, the frost
+descends upon the land; clothe thyself well."; edit it to ~25~ and it
+becomes "The sun smiles gently upon thee; rejoice in this fair day."
+— both directions, since the setter recovers the Celsius reading
+whichever side (Celsius or Fahrenheit) was actually edited.  ~vtable-revert~ only touches the
+table's own region (~vtable-beginning-of-table~ to
+~vtable-end-of-table~), so rewriting the trailing prose text from
+inside the setter is safe — it never collides with the table redraw
+that ~e~ triggers afterward.
+
+*** A self-contained one-liner: ~Converter: <num> C = <num> F~
+
+Since I work with American colleagues, this is a useful widget for me
+to make as a simple one-liner in the form ~Converter: <num> C = <num>
+F~.  No header row, no row-per-temperature — just one line, two
+editable numbers, kept in sync:
+
+#+begin_src emacs-lisp
+(actionable-query-defview xx "C/F Converter"
+  :objects (list (list :celsius "31" :fahrenheit "88"))
+  ;; `:use-header-line t' puts the (blank) header in Emacs's actual
+  ;; header-line, out of the buffer body --- so the buffer shows
+  ;; nothing but this one line of content.
+  :use-header-line t
+  :columns
+  `((:name "" :width 11 :getter (lambda (&rest _) "Converter:"))
+    (:name "" :width 4 :align 'right
+           :editable t
+           :getter (lambda (o &rest _) (plist-get o :celsius))
+           :setter (lambda (o new-value)
+                     (unless (string-match-p "\\`-?[0-9]+\\.?[0-9]*\\'" new-value)
+                       (user-error "Temperature must be a number, got %S" new-value))
+                     (plist-put o :celsius new-value)
+                     (plist-put o :fahrenheit
+                                (format "%d" (round (+ (* (string-to-number new-value) 9.0 (/ 1.0 5)) 32))))))
+    (:name "" :width 4 :getter (lambda (&rest _) "°C"))
+    (:name "" :width 4 :getter (lambda (&rest _) "="))
+    (:name "" :width 5 :align 'right
+           :editable t
+           :getter (lambda (o &rest _) (plist-get o :fahrenheit))
+           :setter (lambda (o new-value)
+                     (unless (string-match-p "\\`-?[0-9]+\\.?[0-9]*\\'" new-value)
+                       (user-error "Temperature must be a number, got %S" new-value))
+                     (plist-put o :fahrenheit new-value)
+                     (plist-put o :celsius
+                                (format "%d" (round (* (- (string-to-number new-value) 32) 5.0 (/ 1.0 9)))))))
+    (:name "" :width 4 :getter (lambda (&rest _)  "°F")))
+  ;; `e' is the global editable-cell key, but RET reads more naturally
+  ;; for a one-line "form" like this --- `aq--edit-current-cell' reads
+  ;; point itself, so rebinding RET to it needs no argument plumbing.
+  :actions '(("RET" "Edit number" (lambda (&rest _) (aq--edit-current-cell)))))
+#+end_src
+
+Renders as ~Converter:  31 C =  87.8 F~ — one object, four columns
+(two literal labels, two editable numbers), no visible header.
+Pressing ~RET~ on either number edits it and converts straight into
+the other, same validation and same whole-table revert as the two-row
+version above; the only difference is shape, not mechanism.
 
 ** ~:actions~ — what the user can do
 
@@ -506,6 +742,7 @@ Every =actionable-query-defview= buffer gets these automatically:
 | ~B~            | Bulk-action transient on marked rows                        |
 | ~=~            | Filter current column by regex                              |
 | ~C-u =~        | Clear all column filters                                    |
+| ~e~            | Edit current cell (column must have ~:editable t~)            |
 | ~M-↑~ / ~M-↓~   | Reorder rows                                                |
 | ~?~            | Transient popup of all actions + commands                   |
 | ~q~            | Bury buffer                                                 |
@@ -806,6 +1043,337 @@ automatically every 15 minutes. Press ~I~ to clock in, ~t~ to cycle TODO,
                                            :title (nth 4 cols)))))
                 callback))))
 #+end_src
+
+** Pomodoro timer (live countdown, deadline-based)
+
+A single-row, no-header view that ticks down once a second, with
+~p~/~r~/~s~ standing in for the usual Pause/Reset/Skip buttons.  The
+countdown is anchored to an absolute wall-clock deadline rather than
+counting down once per timer tick — `run-with-timer' fires late (or
+even drops a repeat) whenever Emacs is busy, so decrementing a
+counter loses time; recomputing ~remaining~ from ~(deadline - now)~
+on every tick keeps the clock accurate regardless of how the timer
+itself behaves. Completing a Work session increments the footer
+count and flips to a Break (and back), exactly like crossing zero
+from pressing ~s~:
+
+#+begin_src emacs-lisp
+(defconst aq-pomo-work-seconds 60)
+(defconst aq-pomo-break-seconds 60)
+
+(defvar-local aq-pomo--mode 'work)
+(defvar-local aq-pomo--remaining aq-pomo-work-seconds)
+(defvar-local aq-pomo--deadline nil)   ; float-time; nil while paused
+(defvar-local aq-pomo--completed 0)
+(defvar-local aq-pomo--timer nil)
+
+(defun aq-pomo--duration (mode)
+  (if (eq mode 'work) aq-pomo-work-seconds aq-pomo-break-seconds))
+
+(defun aq-pomo--mmss (seconds)
+  (format "%02d:%02d" (/ seconds 60) (% seconds 60)))
+
+(defun aq-pomo--bar (mode remaining)
+  (let* ((total (aq-pomo--duration mode))
+         (width 40)
+         (done  (max 0 (min width (round (* width (/ (float (- total remaining)) total)))))))
+    (concat "[" (make-string done ?#) (make-string (- width done) ?-) "]")))
+
+(defun aq-pomo--remaining-until (deadline)
+  (max 0 (ceiling (- deadline (float-time)))))
+
+(defun aq-pomo--redraw ()
+  "Rebuild the single row from buffer-local state and repaint the table
+and the \"Completed pomodoros\" footer.
+Goes straight through `vtable-objects' + `vtable-revert' rather than
+`aq--refresh-fn' / `vtable-revert-command' --- the static `:objects'
+path in `actionable-query-defview' never wires up a vtable
+`:objects-function', so `vtable-revert-command's own re-fetch is a
+no-op for views like this one; redrawing directly here sidesteps
+that gap instead of working around it at the macro level."
+  (save-excursion
+    (when-let ((table (ignore-errors (vtable-current-table))))
+      (setf (vtable-objects table)
+            (list (list :mode aq-pomo--mode :remaining aq-pomo--remaining)))
+      (vtable--clear-cache table)
+      (vtable-revert))
+    (goto-char (point-min))
+    (when-let ((match (text-property-search-forward 'aq-pomo-completed-footer nil nil)))
+      (let ((inhibit-read-only t))
+        (delete-region (prop-match-beginning match) (prop-match-end match))
+        (goto-char (prop-match-beginning match))
+        (insert (propertize (format "Completed pomodoros: %d" aq-pomo--completed)
+                            'face 'font-lock-comment-face
+                            'aq-pomo-completed-footer t))))))
+
+(defun aq-pomo--tick ()
+  "Refresh `aq-pomo--remaining' from the wall clock, then handle a zero crossing."
+  (when-let ((buf (get-buffer "*Org QL View:Pomodoro Timer*")))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (when aq-pomo--deadline
+          (setq aq-pomo--remaining (aq-pomo--remaining-until aq-pomo--deadline))
+          (when (zerop aq-pomo--remaining)
+            (when (eq aq-pomo--mode 'work)
+              (setq aq-pomo--completed (1+ aq-pomo--completed)))
+            (setq aq-pomo--mode      (if (eq aq-pomo--mode 'work) 'break 'work)
+                  aq-pomo--remaining (aq-pomo--duration aq-pomo--mode)
+                  aq-pomo--deadline  (+ (float-time) (aq-pomo--duration aq-pomo--mode))))
+          (let ((win (get-buffer-window buf t)))
+            (if win
+                (with-selected-window win (aq-pomo--redraw))
+              (aq-pomo--redraw))))))))
+
+(actionable-query-defview "Pomodoro Timer"
+  :prose (unless aq-pomo--timer
+           (setq aq-pomo--deadline (+ (float-time) aq-pomo--remaining)
+                 aq-pomo--timer    (run-with-timer 1 1 #'aq-pomo--tick))
+           (add-hook 'kill-buffer-hook
+                     (lambda () (when aq-pomo--timer (cancel-timer aq-pomo--timer)))
+                     nil :local))
+  :objects (lambda () (list (list :mode aq-pomo--mode :remaining aq-pomo--remaining)))
+  :use-header-line t
+  :columns
+  `((:name "" :width 6
+           :getter (lambda (o &rest _) (if (eq (plist-get o :mode) 'work) "Work" "Break"))
+           :displayer (lambda (v w _)
+                        (propertize (truncate-string-to-width v w)
+                                    'face (if (string= v "Work") 'success 'warning))))
+    (:name "" :width 6 :align 'right
+           :getter (lambda (o &rest _) (aq-pomo--mmss (plist-get o :remaining)))
+           :displayer (lambda (v w _) (propertize (truncate-string-to-width v w) 'face 'bold)))
+    (:name "" :width 44
+           :getter (lambda (o &rest _) (aq-pomo--bar (plist-get o :mode) (plist-get o :remaining)))))
+  :actions
+  '(("p" "Pause/Resume"
+     (lambda (&rest _)
+       (if aq-pomo--deadline
+           (setq aq-pomo--remaining (aq-pomo--remaining-until aq-pomo--deadline)
+                 aq-pomo--deadline  nil)
+         (setq aq-pomo--deadline (+ (float-time) aq-pomo--remaining)))
+       (aq-pomo--redraw)))
+    ("r" "Reset"
+     (lambda (&rest _)
+       (setq aq-pomo--remaining (aq-pomo--duration aq-pomo--mode)
+             aq-pomo--deadline  (and aq-pomo--deadline (+ (float-time) aq-pomo--remaining)))
+       (aq-pomo--redraw)))
+    ("s" "Skip"
+     (lambda (&rest _)
+       (setq aq-pomo--remaining 0
+             aq-pomo--deadline  (float-time))
+       (aq-pomo--tick))))
+  :prose-bottom (insert (propertize
+                          (format "Completed pomodoros: %d" aq-pomo--completed)
+                          'face 'font-lock-comment-face
+                          'aq-pomo-completed-footer t)))
+#+end_src
+
+Renders as ~Work  01:00  [----------------------------------------]~,
+ticking down once a second; the bar fills as time elapses (not as it
+remains), matching the usual sense of "progress."  ~p~ pauses by
+freezing ~remaining~ and clearing the deadline, then resumes by
+re-anchoring a fresh deadline ~remaining~ seconds out — the same
+freeze/resume shape as the buttoned version this mimics, just with
+keys instead of clicks.
+
+** CI pipeline dashboard (multi-row, per-row hints, no buttons at all)
+
+Motivated by the CI-dashboard example in
+[[https://github.com/d12frosted/vui.el][vui.el]] — same idea (a job
+table with live progress gauges, summary counts, and per-row
+controls), rebuilt here on top of ~vtable~ instead.
+
+Six jobs, a concurrency limit of two running at once, and a half-second
+tick that advances each running job by a random step until it settles
+— mostly ~passed~, occasionally ~failed~.  No Start button: the
+pipeline kicks off the moment the view opens, via ~:prose~, the same
+way the pomodoro timer above auto-starts.  No Reset button either —
+~g~ does that job for free now that the engine fix above wires a
+0-arg ~:objects~ thunk through as vtable's own ~:objects-function~.
+
+Rather than a Retry button/column, this leans further into
+"actionable": ~:help-echo~ tells you what you can *do* about the row
+under point, not just what its status is — that is the whole point of
+an actionable query, a row that hands back a reaction rather than a
+bare fact:
+
+#+begin_src emacs-lisp
+(defconst aq-ci-concurrency 2
+  "How many jobs may run at the same time.")
+
+(defun aq-ci--initial-jobs ()
+  (list (list :id 1 :name "lint"        :status 'queued :progress 0)
+        (list :id 2 :name "build"       :status 'queued :progress 0)
+        (list :id 3 :name "unit"        :status 'queued :progress 0)
+        (list :id 4 :name "integration" :status 'queued :progress 0)
+        (list :id 5 :name "package"     :status 'queued :progress 0)
+        (list :id 6 :name "deploy"      :status 'queued :progress 0)))
+
+(defvar-local aq-ci--jobs (aq-ci--initial-jobs))
+(defvar-local aq-ci--timer nil)
+
+(defun aq-ci--settled-p (job)
+  (memq (plist-get job :status) '(passed failed)))
+
+(defun aq-ci--bump (job)
+  (if (eq (plist-get job :status) 'running)
+      (let ((next (+ (plist-get job :progress) (+ 8 (random 12)))))
+        (if (>= next 100)
+            (plist-put (plist-put (copy-sequence job) :progress 100)
+                       :status (if (< (random 100) 80) 'passed 'failed))
+          (plist-put (copy-sequence job) :progress next)))
+    job))
+
+(defun aq-ci--fill (jobs)
+  (let ((running (cl-count-if (lambda (j) (eq (plist-get j :status) 'running)) jobs)))
+    (mapcar (lambda (j)
+              (if (and (< running aq-ci-concurrency)
+                       (eq (plist-get j :status) 'queued))
+                  (progn (cl-incf running)
+                         (plist-put (copy-sequence j) :status 'running))
+                j))
+            jobs)))
+
+(defun aq-ci--status-face (status)
+  (pcase status
+    ('queued  'shadow)
+    ('running 'warning)
+    ('passed  'success)
+    ('failed  'error)))
+
+(defun aq-ci--gauge (progress face &optional width)
+  (let* ((width (or width 16))
+         (done  (max 0 (min width (round (* width (/ progress 100.0)))))))
+    (propertize (format "[%s%s] %3d%%"
+                        (make-string done ?#)
+                        (make-string (- width done) ?-)
+                        progress)
+                'face face)))
+
+(defun aq-ci--redraw ()
+  "Repaint the table and the summary-counts header from `aq-ci--jobs'.
+Same direct `vtable-objects' + `vtable-revert' approach as the
+pomodoro demo --- the static `:objects' path never wires up vtable's
+own `:objects-function' re-fetch for views that build it this way.
+Explicitly seeks the table's own start before calling
+`vtable-current-table' --- this runs from a timer, so point may be
+sitting anywhere (even on the summary line above the table, where
+`vtable-current-table' returns nil) rather than wherever a live user
+last left the cursor."
+  (save-excursion
+    (goto-char (point-min))
+    (when-let* ((match (text-property-search-forward 'vtable nil nil))
+                (_     (goto-char (prop-match-beginning match)))
+                (table (vtable-current-table)))
+      (setf (vtable-objects table) aq-ci--jobs)
+      (vtable--clear-cache table)
+      (vtable-revert))
+    (goto-char (point-min))
+    (when-let ((match (text-property-search-forward 'aq-ci-summary nil nil)))
+      (let ((inhibit-read-only t))
+        (delete-region (prop-match-beginning match) (prop-match-end match))
+        (goto-char (prop-match-beginning match))
+        (insert (aq-ci--summary-text))))))
+
+(defun aq-ci--summary-text ()
+  (let ((count (lambda (status)
+                 (cl-count-if (lambda (j) (eq (plist-get j :status) status)) aq-ci--jobs))))
+    (propertize
+     (format "%s  %s  %s  %s"
+             (propertize (format "%d passed"  (funcall count 'passed))  'face 'success)
+             (propertize (format "%d failed"  (funcall count 'failed))  'face 'error)
+             (propertize (format "%d running" (funcall count 'running)) 'face 'warning)
+             (propertize (format "%d queued"  (funcall count 'queued))  'face 'shadow))
+     'aq-ci-summary t)))
+
+(defun aq-ci--tick ()
+  (when-let ((buf (get-buffer "*Org QL View:CI Pipeline*")))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (setq aq-ci--jobs (aq-ci--fill (mapcar #'aq-ci--bump aq-ci--jobs)))
+        (let ((win (get-buffer-window buf t)))
+          (if win (with-selected-window win (aq-ci--redraw)) (aq-ci--redraw)))
+        (when (cl-every #'aq-ci--settled-p aq-ci--jobs)
+          (when aq-ci--timer (cancel-timer aq-ci--timer) (setq aq-ci--timer nil)))))))
+
+(defun aq-ci-retry (job)
+  "Re-queue a failed JOB and restart the clock if it had stopped."
+  (interactive)
+  (let ((id (plist-get job :id)))
+    (setq aq-ci--jobs
+          (mapcar (lambda (j)
+                    (if (eql (plist-get j :id) id)
+                        (plist-put (plist-put (copy-sequence j) :progress 0) :status 'queued)
+                      j))
+                  aq-ci--jobs)))
+  (unless aq-ci--timer
+    (setq aq-ci--timer (run-with-timer 0.5 0.5 #'aq-ci--tick)))
+  (aq-ci--redraw))
+
+(defun aq-ci-explain-failure (_job)
+  "Show a mock failure explanation --- stands in for a real log/trace lookup."
+  (interactive)
+  (message "%s" (shell-command-to-string "fortune | cowsay")))
+
+(defun aq-ci--help-echo (job)
+  "Return the SPC/e hint for JOB's status --- the whole point of an
+\"actionable\" query: the row doesn't just report a status, it tells
+the user what they can do about it."
+  (pcase (plist-get job :status)
+    ('failed  (propertize "SPC - retry this failed job   e - see an explanation for the failure"
+                          'face '(:foreground "red" :weight bold)))
+    ('passed  (propertize "Nothing to do here --- this job is green."
+                          'face 'success))
+    ('running (format "%s is running --- %d%% done." (plist-get job :name) (plist-get job :progress)))
+    ('queued  (format "%s is queued, waiting for a free slot." (plist-get job :name)))))
+
+(actionable-query-defview "CI Pipeline"
+  :prose (progn
+           (setq aq-ci--jobs (aq-ci--initial-jobs))
+           (unless aq-ci--timer
+             (setq aq-ci--timer (run-with-timer 0.5 0.5 #'aq-ci--tick)))
+           (add-hook 'kill-buffer-hook
+                     (lambda () (when aq-ci--timer (cancel-timer aq-ci--timer)))
+                     nil :local)
+           (insert (aq-ci--summary-text)) (insert "\n\n"))
+  :objects (lambda () aq-ci--jobs)
+  :use-header-line t
+  :columns
+  `((:name "Job" :width 12 :getter (lambda (o &rest _) (plist-get o :name)))
+    (:name "Status" :width 9
+           :getter (lambda (o &rest _) (symbol-name (plist-get o :status)))
+           :displayer (lambda (v w _)
+                        (propertize (truncate-string-to-width v w)
+                                    'face (aq-ci--status-face (intern v)))))
+    (:name "Progress" :width 26
+           :getter (lambda (o &rest _)
+                      (aq-ci--gauge (plist-get o :progress)
+                                    (aq-ci--status-face (plist-get o :status))))))
+  :actions '(("SPC" "Retry failed job" aq-ci-retry)
+             ("e"   "Explain failure"  aq-ci-explain-failure))
+  :help-echo #'aq-ci--help-echo)
+#+end_src
+
+Moving point onto a failed row's ~Status~/~Progress~ cell shows, in
+bold red, "SPC - retry this failed job   e - see an explanation for
+the failure" — pressing ~SPC~ re-queues that one job and restarts the
+clock if it had already stopped; ~e~ stands in for a real log/trace
+lookup with ~fortune | cowsay~.  A passed row's hint is simply
+reassurance ("Nothing to do here"); running/queued rows report their
+own progress — every row answers "what now?", not just "what is it?".
+
+*** TODO Wire this to a real pipeline, not a random-number generator
+
+The demo's ~aq-ci--bump~ is a coin flip; the actual jobs I run before
+every push are deterministic and already live as shell commands:
+checkstyle/lint, the build, the test suite.  Swap ~:objects~ for a
+0-arg thunk that shells out to each (~aq--cli-async~ already exists
+for exactly this — see [[*CLI / shell commands]]), use the process exit
+code for ~:status~ instead of a random settle, and let ~e~ on a
+failed row show the real captured stderr/stdout instead of a fortune.
+~SPC~ already does the right thing as-is: re-run that one job.  Worth
+doing once this stabilizes — a one-glance "is it safe to push" view
+beats babysitting a terminal scrollback.
 
 * Calendar / scheduling helpers (~actionable-query-scheduler~)
 

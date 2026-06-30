@@ -319,167 +319,15 @@ Returns the buffer.  Caller is responsible for killing it."
       (aq--stop-loading buf)
       (kill-buffer buf))))
 
-;;; ─── §11½ · inline-spinner placeholders ────────────────────────────────────
+;;; ─── §11½ · async splice placeholders ──────────────────────────────────────
 ;;
-;; Regression coverage for the slot-ordering bug in `oag-morning-standup':
-;; when a host buffer interleaves prose with several `(view :insert t)' calls
-;; whose data arrives async, deliveries used to race and clump at the
-;; bottom.  The placeholder pattern reserves each slot synchronously.
-
-(deftest "placeholder -- insert is synchronous and visible at point"
-  (let ((buf (generate-new-buffer " *aq-placeholder-test-insert*")))
-    (unwind-protect
-        (let* ((_ (with-current-buffer buf (insert "before\n")))
-               (placeholder
-                (with-current-buffer buf
-                  (aq--insert-pending-placeholder buf :label "fetching foo…"))))
-          ;; Region exists, glyph + label are visible, markers are live.
-          (with-current-buffer buf
-            (should (string-match-p "before\n⏳ fetching foo…\n"
-                                    (buffer-string))))
-          (should (markerp (plist-get placeholder :start-marker)))
-          (should (markerp (plist-get placeholder :end-marker)))
-          (should (timerp  (plist-get placeholder :glyph-timer)))
-          (should (timerp  (plist-get placeholder :deadline)))
-          ;; Cleanup: cancel timers so they don't fire after the test.
-          (aq--placeholder-cancel-timers placeholder))
-      (kill-buffer buf))))
-
-(deftest "placeholder -- resolve replaces region with rendered content"
-  (let ((host (generate-new-buffer " *aq-placeholder-test-resolve-host*"))
-        (src  (generate-new-buffer " *aq-placeholder-test-resolve-src*")))
-    (unwind-protect
-        (progn
-          (with-current-buffer src (insert "RENDERED VTABLE CONTENT"))
-          (with-current-buffer host (insert "before\n"))
-          (let ((placeholder
-                 (with-current-buffer host
-                   (aq--insert-pending-placeholder host :label "fetching X…"))))
-            (aq--resolve-placeholder placeholder src
-                                     :view-name "test-view"
-                                     :actions   nil
-                                     :async-fn  (lambda (_) nil))
-            (with-current-buffer host
-              ;; Placeholder gone, source content present.
-              (should-not (string-match-p "⏳" (buffer-string)))
-              (should     (string-match-p "RENDERED VTABLE CONTENT"
-                                          (buffer-string))))
-            ;; Markers nilled, timers cancelled.
-            (should-not (marker-buffer (plist-get placeholder :start-marker)))
-            (should-not (marker-buffer (plist-get placeholder :end-marker)))))
-      (kill-buffer host)
-      (kill-buffer src))))
-
-(deftest "placeholder -- out-of-order delivery preserves slot ordering"
-  ;; Insert two placeholders A and B, deliver to B first, then A.
-  ;; A's content must sit BEFORE B's in the buffer — this is the regression
-  ;; test for the `oag-morning-standup' clumping bug.
-  (let ((host (generate-new-buffer " *aq-placeholder-test-ordering-host*"))
-        (src-a (generate-new-buffer " *aq-placeholder-test-ordering-a*"))
-        (src-b (generate-new-buffer " *aq-placeholder-test-ordering-b*")))
-    (unwind-protect
-        (progn
-          (with-current-buffer src-a (insert "AAA"))
-          (with-current-buffer src-b (insert "BBB"))
-          (with-current-buffer host (insert "* Section A\n"))
-          (let ((ph-a (with-current-buffer host
-                        (aq--insert-pending-placeholder host :label "A…"))))
-            (with-current-buffer host
-              (goto-char (point-max))
-              (insert "* Section B\n"))
-            (let ((ph-b (with-current-buffer host
-                          (aq--insert-pending-placeholder host :label "B…"))))
-              ;; Deliver B first, then A — the bad ordering case.
-              (aq--resolve-placeholder ph-b src-b
-                                       :view-name "B" :actions nil
-                                       :async-fn (lambda (_) nil))
-              (aq--resolve-placeholder ph-a src-a
-                                       :view-name "A" :actions nil
-                                       :async-fn (lambda (_) nil))
-              (with-current-buffer host
-                (let* ((s   (buffer-string))
-                       (pos-a (string-match "AAA" s))
-                       (pos-b (string-match "BBB" s)))
-                  (should pos-a)
-                  (should pos-b)
-                  (should (< pos-a pos-b)))))))
-      (kill-buffer host)
-      (kill-buffer src-a)
-      (kill-buffer src-b))))
-
-(deftest "placeholder -- resolve leaves point past splice for prose interleaving"
-  ;; Regression test for the cached-deliver clumping bug.  When a caller
-  ;; composes a buffer like
-  ;;
-  ;;   (insert "* Section 1\n")
-  ;;   (view-A :insert t)            ; cached → resolves synchronously
-  ;;   (insert "* Section 2\n")
-  ;;   (view-B :insert t)
-  ;;
-  ;; both views are cached, so both placeholders resolve **before** the
-  ;; corresponding `(:insert t)' returns.  The prior `save-excursion'
-  ;; inside `aq--splice-view-into' restored point to the *start* of the
-  ;; spliced span ---so the subsequent `(insert "* Section 2\n")' landed
-  ;; in front of view-A's vtable, and view-B then spliced between the
-  ;; new heading and view-A.  Net: both vtables clumped under heading 2,
-  ;; in reverse of source order.
-  ;;
-  ;; The fix drops `save-excursion', so resolve leaves point at the END
-  ;; of the splice ---like `insert' does--- and prose after the call
-  ;; composes naturally.
-  (let ((host (generate-new-buffer " *aq-placeholder-test-prose-interleave-host*"))
-        (src-a (generate-new-buffer " *aq-placeholder-test-prose-interleave-a*"))
-        (src-b (generate-new-buffer " *aq-placeholder-test-prose-interleave-b*")))
-    (unwind-protect
-        (progn
-          (with-current-buffer src-a (insert "AAA"))
-          (with-current-buffer src-b (insert "BBB"))
-          (with-current-buffer host
-            (insert "* Section 1\n")
-            ;; Mimic `(view-A :insert t)' with a cached hit: drop a
-            ;; placeholder and resolve it synchronously.
-            (let ((ph-a (aq--insert-pending-placeholder host :label "A…")))
-              (aq--resolve-placeholder ph-a src-a
-                                       :view-name "A" :actions nil
-                                       :async-fn (lambda (_) nil)))
-            ;; Now interleave more prose.  This must land AFTER AAA, not
-            ;; before it; the bug shoved heading 2 in front of AAA.
-            (insert "* Section 2\n")
-            (let ((ph-b (aq--insert-pending-placeholder host :label "B…")))
-              (aq--resolve-placeholder ph-b src-b
-                                       :view-name "B" :actions nil
-                                       :async-fn (lambda (_) nil)))
-            (let* ((s         (buffer-string))
-                   (pos-h1    (string-match "Section 1" s))
-                   (pos-aaa   (string-match "AAA" s))
-                   (pos-h2    (string-match "Section 2" s))
-                   (pos-bbb   (string-match "BBB" s)))
-              (should pos-h1)
-              (should pos-aaa)
-              (should pos-h2)
-              (should pos-bbb)
-              ;; Source order: heading 1, AAA, heading 2, BBB.
-              (should (< pos-h1  pos-aaa))
-              (should (< pos-aaa pos-h2))
-              (should (< pos-h2  pos-bbb)))))
-      (kill-buffer host)
-      (kill-buffer src-a)
-      (kill-buffer src-b))))
-
-(deftest "placeholder -- fail replaces region with ⚠️ note"
-  (let ((host (generate-new-buffer " *aq-placeholder-test-fail*")))
-    (unwind-protect
-        (let ((placeholder (with-current-buffer host
-                             (aq--insert-pending-placeholder
-                              host :label "fetching Z…"))))
-          (aq--fail-placeholder placeholder "deadline hit")
-          (with-current-buffer host
-            (should-not (string-match-p "⏳" (buffer-string)))
-            (should     (string-match-p "⚠️ Fetch failed: deadline hit"
-                                        (buffer-string))))
-          (should-not (marker-buffer (plist-get placeholder :start-marker)))
-          (should-not (marker-buffer (plist-get placeholder :end-marker))))
-      (kill-buffer host))))
+;; The placeholder primitive moved to `~/actionable-query/point-async/'
+;; ---a self-contained slot-passing reservation library with no AQ
+;; coupling.  Generic regression coverage (slot ordering, prose
+;; interleaving, sync vs truly-async resolves, deadline failure) lives
+;; in `point-async/point-async-tests.el'.  AQ-side integration is
+;; exercised through the `sym-form' tests below ---e.g.
+;; `(sym t) inserts cached content at point in current buffer'.
 
 ;;; ─── §12 · aq--parse-refresh-interval ────────────────────────────────────
 
@@ -563,7 +411,6 @@ time, so we do not need a separate `funcall' here."
 Date  Title  Category
 2026-05-07 Emacs 30 Released emacs
 2026-05-07 Org-mode Tips org, emacs
-2023-12-24 Java CheatSheet java
 
 Older
 Date  Title  Category

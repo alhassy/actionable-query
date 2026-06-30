@@ -40,33 +40,126 @@ Fires asynchronously via `osascript'; never blocks Emacs."
 ;;; ─── marker helpers ──────────────────────────────────────────────────────────
 
 (defun aq-agenda--current-marker ()
-  "Return the `org-hd-marker' or `org-marker' on the current line, or nil."
+  "Return the Org marker for the current line, or nil.
+Checks the `org-hd-marker'/`org-marker' line properties first (set by
+`aq--install-org-marker' on standalone views), then falls back to a
+`:marker' on the row's `vtable-object' --- the splice path doesn't run
+the org-marker post-command hook, but the object is always on the line."
   (or (get-text-property (line-beginning-position) 'org-hd-marker)
-      (get-text-property (line-beginning-position) 'org-marker)))
+      (get-text-property (line-beginning-position) 'org-marker)
+      (when-let* ((obj (get-text-property (line-beginning-position) 'vtable-object))
+                  ((consp obj))
+                  (m (plist-get obj :marker))
+                  ((markerp m)))
+        m)))
+
+(defvar aq--org-serializer)             ; from actionable-query.el (buffer-local)
+
+(defun aq--parse-org-serializer-spec (spec)
+  "Parse an `:org-serializer' SPEC into (TITLE PROPS BODY).
+SPEC is either a STRING (just the title) or a list
+\(TITLE :K V … BODY) where the :K V pairs become PROPS (an alist of
+\(\"K\" . \"V\") with stringified keys/values) and an optional trailing
+non-keyword STRING becomes BODY.  Returns (TITLE PROPS BODY); PROPS and
+BODY may be nil.  TITLE is nil when SPEC is malformed."
+  (cond
+   ((stringp spec) (list spec nil nil))
+   ((consp spec)
+    (let ((title (car spec))
+          (rest  (cdr spec))
+          props body)
+      (while (keywordp (car rest))
+        (push (cons (substring (symbol-name (car rest)) 1)   ; ":ZOOM" → "ZOOM"
+                    (format "%s" (cadr rest)))
+              props)
+        (setq rest (cddr rest)))
+      (when (stringp (car rest)) (setq body (car rest)))
+      (list (and (stringp title) title) (nreverse props) body)))
+   (t (list nil nil nil))))
+
+(defun aq--row-serializer-spec (obj)
+  "Run the view's `:org-serializer' on row OBJ, returning its raw SPEC or nil."
+  (when (and (bound-and-true-p aq--org-serializer) (consp obj))
+    (funcall aq--org-serializer obj)))
 
 (defun aq-agenda--ensure-marker (obj title-string)
   "Return a live Org marker for OBJ, creating a heading if none exists.
-TITLE-STRING is the heading text to use when creating.  The new heading
-lands at the end of `org-default-notes-file' with a CREATED timestamp."
+TITLE-STRING is the fallback headline.  When the view supplied
+`:org-serializer', its SPEC for OBJ drives the new tree's title,
+properties, and body (see `aq--parse-org-serializer-spec') --- a calendar
+view uses this to serialize the SCHEDULED time, Zoom link, attendees, etc.
+The new heading lands at the end of `org-default-notes-file'."
   (let* ((table (actionable-query-resolve-org-markers
                  (list obj) (lambda (_) title-string)))
-         (marker (gethash obj table)))
+         (marker (gethash obj table))
+         ;; Resolve the spec *here*, in the view buffer where the serializer
+         ;; is bound (we switch buffers to create the heading below).
+         (parsed (aq--parse-org-serializer-spec (aq--row-serializer-spec obj)))
+         (title  (or (nth 0 parsed) title-string))
+         (props  (nth 1 parsed))
+         (body   (nth 2 parsed)))
     (or (and (markerp marker) (marker-buffer marker) marker)
-        ;; Nothing found — create a minimal TODO heading.
         (with-current-buffer (find-file-noselect org-default-notes-file)
           (save-excursion
             (goto-char (point-max))
             (unless (bolp) (insert "\n"))
-            (insert (format "* TODO %s\n  :PROPERTIES:\n  :CREATED: %s\n  :END:\n"
-                            title-string
-                            (format-time-string "[%Y-%m-%d %a %H:%M]")))
+            ;; Headline first; a SCHEDULED/DEADLINE planning line (if the view
+            ;; passes one as a property named SCHEDULED) is handled by Org's
+            ;; own machinery via `org-entry-put', which places it correctly.
+            (insert (format "* TODO %s\n" title))
+            (when (and (stringp body) (not (string-empty-p body)))
+              (insert "  " (string-trim body) "\n"))
             (org-back-to-heading t)
+            (dolist (kv props)
+              (org-entry-put (point) (car kv) (cdr kv)))
+            (org-entry-put (point) "CREATED"
+                           (format-time-string "[%Y-%m-%d %a %H:%M]"))
             (point-marker))))))
 
-(defun aq-agenda--marker-or-error ()
-  "Return the Org marker for the current row, or signal `user-error'."
+(defun aq-agenda--row-title (obj)
+  "Best-effort heading text for the current row.
+Resolution order:
+  1. the TITLE from the view's `:org-serializer' SPEC, if any;
+  2. OBJ's `:heading'/`:title'/`:subject' plist keys;
+  3. the visible text of the row at point.
+So a view can override how a markerless row is titled, and even a row with
+no titley key still yields something to name a created heading after."
+  (or (let ((title (nth 0 (aq--parse-org-serializer-spec
+                           (aq--row-serializer-spec obj)))))
+        (and (stringp title) (not (string-empty-p title)) title))
+      (and (consp obj)
+           (or (plist-get obj :heading)
+               (plist-get obj :title)
+               (plist-get obj :subject)))
+      (let ((line (string-trim
+                   (buffer-substring-no-properties (line-beginning-position)
+                                                   (line-end-position)))))
+        (unless (string-empty-p line) line))))
+
+(defun aq-agenda--marker-or-create ()
+  "Return the Org marker for the current row, creating a tree if none exists.
+A main point of actionable-query is that org-agenda-style keys work on any
+row --- so a markerless row (e.g. a gcal/Gerrit item with no Org heading)
+gets a fresh `* TODO <title>' heading minted at the end of
+`org-default-notes-file', and that marker is stitched back onto the row's
+object so later commands act on the same heading."
   (or (aq-agenda--current-marker)
-      (user-error "No Org entry linked to this row — add `:org' to your view")))
+      (let* ((obj   (get-text-property (line-beginning-position) 'vtable-object))
+             (title (or (aq-agenda--row-title obj)
+                        (user-error "No Org entry, and no title to create one from")))
+             (marker (aq-agenda--ensure-marker obj title)))
+        ;; Stitch the new marker onto the row object so subsequent commands /
+        ;; the org-marker line property find it without re-creating.
+        (when (consp obj)
+          (plist-put obj :marker marker)
+          (let ((inhibit-read-only t))
+            (put-text-property (line-beginning-position) (line-end-position)
+                               'org-hd-marker marker)))
+        marker)))
+
+;; Backward-compatible alias: callers historically used the -or-error name,
+;; which now creates-on-miss rather than signalling.
+(defalias 'aq-agenda--marker-or-error #'aq-agenda--marker-or-create)
 
 ;;; ─── display helper (mirrors org-agenda-show-new-time) ──────────────────────
 
@@ -95,12 +188,36 @@ so it disappears on the next vtable revert without any cleanup."
 
 ;;; ─── post-mutation display refresh ──────────────────────────────────────────
 
-(defun aq-agenda--update-line (_marker)
-  "Refresh the vtable after a mutation.  MARKER is accepted but unused;
-a full `vtable-revert' is the safest correct choice for now."
+(defun aq-agenda--goto-marker-row (marker)
+  "Move point to the row whose `:marker' points at the same heading as MARKER.
+Compares by buffer + position, not `eq' --- a table re-query mints a fresh
+marker for the same heading, so identity wouldn't match."
+  (when (markerp marker)
+    (goto-char (point-min))
+    (let (found)
+      (while (and (not found) (not (eobp)))
+        (let* ((obj (get-text-property (line-beginning-position) 'vtable-object))
+               (m   (and (consp obj) (plist-get obj :marker))))
+          (if (and (markerp m)
+                   (eq (marker-buffer m) (marker-buffer marker))
+                   (= (marker-position m) (marker-position marker)))
+              (setq found t)
+            (forward-line 1))))
+      found)))
+
+(defun aq-agenda--update-line (marker)
+  "Refresh the vtable after a mutation, keeping point on MARKER's row.
+Uses `vtable-revert-command' (re-queries the `:objects-function') rather
+than `vtable-revert' (mere redraw) so a reschedule/retag/etc. actually
+re-pulls the changed data.  After the revert the row may have moved (e.g.
+re-sorted by its new time), so we seek back to it by MARKER.  Binds
+`inhibit-read-only' since view buffers are read-only --- otherwise the
+rewrite silently no-ops."
   (when-let ((tbl (vtable-current-table)))
-    (vtable--clear-cache tbl)
-    (vtable-revert)))
+    (let ((inhibit-read-only t))
+      (vtable--clear-cache tbl)
+      (vtable-revert-command)
+      (aq-agenda--goto-marker-row marker))))
 
 ;;; ─── agenda commands ─────────────────────────────────────────────────────────
 

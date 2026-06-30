@@ -113,33 +113,41 @@ SNOOZE-PERIOD is one of: `tomorrow' (default), `next-week', `forever'."
 
 (defun aq--install-hearting (view-name all-objects-fn)
   "Bind `h' (toggle heart) and `H' (toggle hearted-only) buffer-locally.
-ALL-OBJECTS-FN is a 0-arg thunk returning the current full object list."
-  (local-set-key
-   (kbd "h")
-   (lambda ()
-     (interactive)
-     (when-let ((o (vtable-current-object)))
-       (let ((now-hearted (aq--toggle-heart view-name o)))
-         (aq--message "%s %s"
-                         (if now-hearted "❤️  Hearted:" "🩶 Un-hearted:")
-                         (aq--obj-id o))
-         (when (and aq--show-hearted-only (not now-hearted))
-           (vtable-remove-object (vtable-current-table) o))
-         (aq--update-heart-footer view-name)))))
-  (local-set-key
-   (kbd "H")
-   (lambda ()
-     (interactive)
-     (setq aq--show-hearted-only (not aq--show-hearted-only))
-     (let* ((table (vtable-current-table))
-            (all   (funcall all-objects-fn))
-            (shown (if aq--show-hearted-only
-                       (cl-remove-if-not (lambda (o) (aq--heart-p view-name o)) all)
-                     all)))
-       (setf (vtable-objects table) shown)
-       (vtable--clear-cache table)
-       (vtable-revert)
-       (aq--update-heart-footer view-name)))))
+ALL-OBJECTS-FN is a 0-arg thunk returning the current full object list.
+
+Binds via a fresh sparse map layered with `use-local-map' rather than
+`local-set-key': the latter mutates whatever the current local map writes
+through to, and in a `org-mode' view buffer that is the *shared*
+`org-mode-map', so `local-set-key' would leak `h'/`H' into every org buffer.
+A private composed map keeps the bindings truly buffer-local.  (Spliced
+views never call this --- `h'/`H' there are region-scoped via
+`aq--region-key-table'.)"
+  (let ((map (make-sparse-keymap)))
+    (keymap-set map "h"
+                (lambda ()
+                  (interactive)
+                  (when-let ((o (vtable-current-object)))
+                    (let ((now-hearted (aq--toggle-heart view-name o)))
+                      (aq--message "%s %s"
+                                   (if now-hearted "❤️  Hearted:" "🩶 Un-hearted:")
+                                   (aq--obj-label o))
+                      (when (and aq--show-hearted-only (not now-hearted))
+                        (vtable-remove-object (vtable-current-table) o))
+                      (aq--update-heart-footer view-name)))))
+    (keymap-set map "H"
+                (lambda ()
+                  (interactive)
+                  (setq aq--show-hearted-only (not aq--show-hearted-only))
+                  (let* ((table (vtable-current-table))
+                         (all   (funcall all-objects-fn))
+                         (shown (if aq--show-hearted-only
+                                    (cl-remove-if-not (lambda (o) (aq--heart-p view-name o)) all)
+                                  all)))
+                    (setf (vtable-objects table) shown)
+                    (vtable--clear-cache table)
+                    (vtable-revert)
+                    (aq--update-heart-footer view-name))))
+    (use-local-map (make-composed-keymap map (current-local-map)))))
 
 (defun aq--dismissed-for-view (view-name)
   "Return alist of (key . id-list) for all entries in VIEW-NAME's snooze hash."

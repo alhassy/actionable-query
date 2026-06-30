@@ -90,19 +90,30 @@ function die(msg) {
 
 // ─── Baileys setup (only needed for auth and send) ───────────────────────────
 
-const {
-  makeWASocket,
-  useMultiFileAuthState,
-  DisconnectReason,
-  fetchLatestBaileysVersion,
-  makeCacheableSignalKeyStore,
-} = require('@whiskeysockets/baileys');
-
-const pino   = require('pino');
-const logger = pino({ level: 'silent' }, pino.destination(2));
-const qrcode = require('qrcode-terminal');
+// ponytail: auto-installs missing deps on first auth/send instead of requiring
+// a manual one-time `npm install` ritual the user has to remember.
+function requireOrInstall(pkg) {
+  try {
+    return require(pkg);
+  } catch (err) {
+    if (err.code !== 'MODULE_NOT_FOUND') throw err;
+    require('child_process').execFileSync(
+      'npm', ['install', '@whiskeysockets/baileys', 'qrcode-terminal', 'pino'],
+      { cwd: __dirname, stdio: ['ignore', 'ignore', 'inherit'] });
+    return require(pkg);
+  }
+}
 
 async function makeSocket() {
+  const {
+    makeWASocket,
+    useMultiFileAuthState,
+    fetchLatestBaileysVersion,
+    makeCacheableSignalKeyStore,
+  } = requireOrInstall('@whiskeysockets/baileys');
+  const pino   = requireOrInstall('pino');
+  const logger = pino({ level: 'silent' }, pino.destination(2));
+
   fs.mkdirSync(SESSION_DIR, { recursive: true });
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
   const { version } = await fetchLatestBaileysVersion();
@@ -115,12 +126,12 @@ async function makeSocket() {
   return sock;
 }
 
-const FATAL_CODES = new Set([
-  DisconnectReason.loggedOut, DisconnectReason.forbidden,
-  DisconnectReason.badSession, DisconnectReason.multideviceMismatch,
-]);
-
 async function connectWithRetry(onQR) {
+  const { DisconnectReason } = requireOrInstall('@whiskeysockets/baileys');
+  const FATAL_CODES = new Set([
+    DisconnectReason.loggedOut, DisconnectReason.forbidden,
+    DisconnectReason.badSession, DisconnectReason.multideviceMismatch,
+  ]);
   while (true) {
     const sock = await makeSocket();
     const result = await new Promise((resolve) => {
@@ -151,6 +162,10 @@ async function connectWithRetry(onQR) {
 // ─── auth ─────────────────────────────────────────────────────────────────────
 
 async function cmdAuth() {
+  const qrcode = requireOrInstall('qrcode-terminal');
+  // Stale creds make Baileys try (and get rejected) with the dead identity
+  // before ever reaching the empty-creds path that emits a fresh QR.
+  fs.rmSync(SESSION_DIR, { recursive: true, force: true });
   let qrShown = false;
   const sock = await connectWithRetry((qr) => {
     if (!qrShown) {
@@ -178,11 +193,43 @@ function cmdContacts() {
     ORDER BY ZFULLNAME COLLATE NOCASE
   `);
 
-  const list = rows.map(r => ({
-    jid:   r.ZWHATSAPPID,
-    name:  r.ZFULLNAME,
-    phone: r.ZLOCALIZEDPHONENUMBER || r.ZPHONENUMBER || jidToPhone(r.ZWHATSAPPID),
-  }));
+  // Last message per chat lives in a *separate* DB, so we can't JOIN; pull a
+  // jid → snippet map and merge in JS.  ZISFROMME flags whether I sent it, so
+  // the snippet can read "you: …" vs "them: …".
+  const EPOCH_OFFSET = 978307200;
+  const chats = sqliteQuery(CHAT_DB, `
+    SELECT s.ZCONTACTJID AS jid, s.ZLASTMESSAGEDATE AS ts,
+           m.ZTEXT AS snippet, m.ZISFROMME AS fromme
+    FROM ZWACHATSESSION s
+    LEFT JOIN ZWAMESSAGE m ON m.Z_PK = s.ZLASTMESSAGE
+    WHERE s.ZCONTACTJID NOT LIKE '%@g.us'
+  `);
+  // Session jids may be in LID form (`…@lid`); normalise each to the phone-jid
+  // (`…@s.whatsapp.net`) that contacts use, so the merge below matches.
+  const lastByJid = {};
+  for (const c of chats) {
+    if (!c.jid) continue;
+    // A textless last message (sticker/media/voice) shows as "{media}" rather
+    // than an empty string, so the row still reads as a real exchange.
+    const body = (c.snippet || '').replace(/\s+/g, ' ').trim() || '{media}';
+    lastByJid[resolveLid(c.jid)] = {
+      snippet: (c.fromme ? 'you: ' : '') + body,
+      ts: c.ts ? new Date((c.ts + EPOCH_OFFSET) * 1000).toISOString() : '',
+    };
+  }
+
+  const list = rows.map(r => {
+    const jid = r.ZWHATSAPPID;
+    const last = lastByJid[jid] || lastByJid[resolveLid(jid)] || {};
+    return {
+      id:    jid,   // stable identity for hearting/dismissal (see `aq--obj-id')
+      jid,
+      name:  r.ZFULLNAME,
+      phone: r.ZLOCALIZEDPHONENUMBER || r.ZPHONENUMBER || jidToPhone(jid),
+      snippet:   (last.snippet || '').slice(0, 120),
+      timestamp: last.ts || '',
+    };
+  });
 
   process.stdout.write(JSON.stringify(list) + '\n');
 }

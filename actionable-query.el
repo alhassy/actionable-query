@@ -113,6 +113,12 @@
 
 ;;; Code:
 
+;;; ─── user options ────────────────────────────────────────────────────────────
+;;
+;; (No user options in this section any more: the old `aq-defview-open-on-define'
+;; variable has been replaced by a `fancy-C-x-C-e' extension that detects
+;; interactive eval automatically via `load-file-name'.)
+
 ;;; ─── self-locating sub-module load-path ─────────────────────────────────────
 ;;
 ;; Every module lives under one of `render/', `data/', `state/', or
@@ -122,7 +128,7 @@
 ;; `package.el', `straight.el', whatever.
 
 (let ((root (file-name-directory (or load-file-name buffer-file-name))))
-  (dolist (sub '("render" "data" "state" "interaction"))
+  (dolist (sub '("render" "data" "state" "interaction" "point-async"))
     (add-to-list 'load-path (expand-file-name sub root))))
 
 (require 'cl-lib)
@@ -143,33 +149,10 @@
 (require 'aq-interaction-bulk)         ; mark / unmark / bulk transient
 (require 'aq-interaction-popup)        ; transient `?' popup
 (require 'aq-interaction-filters)      ; `=' column filters
+(require 'aq-interaction-edit)         ; `e' editable-cell edit
 (require 'aq-interaction-keys)         ; vtable + region keymaps
 (require 'aq-render-grouped)           ; multi-table grouped layout
 (require 'aq-render-splice)            ; splice into host buffer
-
-;;; ─── C-x C-e: eval actionable-query-defview and open the view immediately ──
-
-(defun aq--eval-last-sexp (orig-fn &rest args)
-  "Around `eval-last-sexp': if the form is `actionable-query-defview', open the view after eval."
-  (let (view-name)
-    (save-excursion
-      (backward-sexp)
-      (when-let* ((form (sexp-at-point))
-                  (_    (eq (car-safe form) 'actionable-query-defview))
-                  (head (cadr form)))
-        (setq view-name
-              (cond
-               ;; (defview SYM "Title" …) — symbol head, name is caddr
-               ((and (symbolp head) (not (keywordp head))) (caddr form))
-               ;; (defview "Title" …) — string head
-               ((stringp head) head)
-               ;; (defview :keyword …) — anonymous, no view to open
-               (t nil)))))
-    (apply orig-fn args)
-    (when (stringp view-name)
-      (org-ql-view view-name))))
-
-(advice-add #'eval-last-sexp :around #'aq--eval-last-sexp)
 
 ;;; ─── action augmentation ────────────────────────────────────────────────────
 
@@ -207,25 +190,51 @@ symbol (e.g., `tomorrow')."
 
 ;;; ─── async deliver glue ────────────────────────────────────────────────────
 
+(defun aq--enter-view-mode ()
+  "Enter read-only `org-mode' with the standalone nav keymap.
+This is the substrate for standalone actionable-query view buffers ---
+the project's whole point is to be an alternative to `org-agenda-mode',
+so we render into a plain read-only org buffer and supply our own
+RET/TAB/n/p/q nav (see `aq--standalone-nav-map') rather than inheriting
+the agenda's.  The marker-based `aq-agenda-*' commands work regardless
+of major mode, so nothing of substance is lost."
+  (org-mode)
+  ;; org-mode turns font-lock ON, whose jit-lock pass would overwrite the
+  ;; vtable rows' `face' text-properties (the colours).  org-agenda-mode used
+  ;; to render with font-lock OFF, so colours showed directly.  This buffer is
+  ;; a rendered table, not editable prose --- font-lock buys nothing here, so
+  ;; turn it off and let the vtable `face' properties render as-is.
+  (font-lock-mode -1)
+  (setq buffer-read-only t)
+  ;; Our nav map goes FIRST so RET/n/p/q/TAB beat org-mode's own bindings
+  ;; (e.g. `org-return').  View `:actions' still win regardless --- they ride
+  ;; on a higher-priority `keymap' text-property installed on each row.
+  (use-local-map (make-composed-keymap aq--standalone-nav-map (current-local-map))))
+
 (defmacro aq--with-agenda-mode (&rest body)
-  "Erase buffer, enter `org-agenda-mode', restore actionable-query buffer-locals, run BODY.
-`org-agenda-mode' wipes buffer-local variables; this macro saves and restores
-the six AQ locals that must survive the call."
+  "Erase buffer, enter the view mode, restore AQ buffer-locals, run BODY.
+Switching major mode wipes buffer-local variables; this macro saves and
+restores the seven AQ locals that must survive the call.  (Name kept for
+call-site stability; the mode is now read-only `org-mode', see
+`aq--enter-view-mode'.)"
   (declare (indent 0))
   `(let ((--refresh-fn  aq--refresh-fn)
          (--start-time  aq--last-fetch-start-time)
          (--all         aq--all-objects)
          (--total       aq--total-objects)
          (--post-hook   aq--post-deliver-hook)
-         (--hearted-p   aq--show-hearted-only))
+         (--hearted-p   aq--show-hearted-only)
+         (--editable    aq--editable-setters)
+         (inhibit-read-only t))
      (erase-buffer)
-     (org-agenda-mode)
+     (aq--enter-view-mode)
      (setq aq--refresh-fn            --refresh-fn
            aq--last-fetch-start-time --start-time
            aq--all-objects           --all
            aq--total-objects         --total
            aq--post-deliver-hook     --post-hook
-           aq--show-hearted-only     --hearted-p)
+           aq--show-hearted-only     --hearted-p
+           aq--editable-setters      --editable)
      ,@body))
 
 (defun aq--make-deliver (buf view-name actions snooze
@@ -233,14 +242,16 @@ the six AQ locals that must survive the call."
                                 prose-thunk help-echo-fn
                                 rest-kwargs-sans-columns
                                 has-prose-bottom
-                                org-fn)
+                                org-fn &optional no-footer)
   "Return the DELIVER callback used by async `:objects' fns.
 Drops the loading spinner, optionally groups via GROUP-BY-FN,
 applies snooze + filters, and either re-renders an existing vtable
 (refresh path) or builds one from scratch (first-delivery path).
 PROSE-THUNK, if non-nil, is funcalled at prose insertion points.
 HAS-PROSE-BOTTOM suppresses the \"Last fetched at …\" footer.
-ORG-FN, if non-nil, is passed to `aq--install-org-marker' after grouped render."
+ORG-FN, if non-nil, is passed to `aq--install-org-marker' after grouped render.
+NO-FOOTER, when non-nil, suppresses the snooze/unread footer too --- for
+single-row widgets (clock, weather) where the count is just noise."
   (lambda (raw-objects)
     (unless (and (buffer-live-p buf)
                  (buffer-local-value 'aq--fetch-aborted buf))
@@ -285,7 +296,13 @@ ORG-FN, if non-nil, is passed to `aq--install-org-marker' after grouped render."
                     (aq--apply-filters
                      (cl-remove-if
                       (lambda (o) (member (aq--obj-id o) dismissed))
-                      raw-objects)
+                      ;; Hearted-only filter at the data layer (not a
+                      ;; post-deliver mutation), so the *spliced* copy is
+                      ;; already filtered --- a later hook would mutate only
+                      ;; the now-orphaned view-buffer table.
+                      (if aq--show-hearted-only
+                          (cl-remove-if-not (lambda (o) (aq--heart-p view-name o)) raw-objects)
+                        raw-objects))
                      aq--active-filters
                      coerced-cols)))
               (if table
@@ -324,8 +341,10 @@ ORG-FN, if non-nil, is passed to `aq--install-org-marker' after grouped render."
             (when elapsed
               (puthash view-name elapsed aq--last-elapsed-cache))
             (puthash view-name raw-objects aq--object-cache)
+            ;; `nil' total skips the "N unread" line; with no dismissals and
+            ;; no filters the formatter then axes the footer entirely.
             (aq--update-dismissed-footer
-             view-name snooze aq--total-objects)
+             view-name snooze (unless no-footer aq--total-objects))
             (unless has-prose-bottom
               (aq--upsert-footer
                'actionable-query-fetch-footer
@@ -340,6 +359,22 @@ ORG-FN, if non-nil, is passed to `aq--install-org-marker' after grouped render."
 (defvar-local aq--fetch-aborted nil
   "Non-nil when the user pressed Q to abort the current in-flight fetch.
 The deliver callback checks this flag and no-ops if set; reset on next `g'.")
+
+(defvar-local aq--org-serializer nil
+  "View-supplied (lambda (row-object) -> SPEC) describing a created Org tree.
+Set from the `:org-serializer' defview keyword.  When an agenda command
+mints a heading for a markerless row, `aq-agenda--ensure-marker' calls this
+to decide the new tree's title, properties, and body.  SPEC is either:
+
+  - a STRING            → that becomes the headline; no properties, no body; or
+  - (TITLE :K V … BODY) → TITLE is the headline string; each :K V pair
+                          becomes a property; a trailing non-keyword STRING
+                          (optional) becomes the body text.
+
+So a calendar view can return e.g.
+  (\"Standup\" :ZOOM \"https://…\" :SCHEDULED \"<2026-…>\" \"agenda notes\").
+Parsed by `aq--parse-org-serializer-spec'.  Nil means fall back to the
+generic title heuristics in `aq-agenda--row-title'.")
 
 (defun aq-abort-fetch ()
   "Abort the in-flight async fetch for this view.
@@ -361,10 +396,21 @@ Installs row-reorder, column-filter, popup, bulk, help-echo, and
 HELP-ECHO-FN falls back to `aq--default-help-echo' when nil."
   (aq--install-row-reorder)
   (aq--install-column-filter view-name)
+  (aq--install-cell-edit)
+  (aq--install-cell-edit-highlight)
   (aq--install-popup actions)
   (aq--install-bulk actions)
   (aq--install-help-echo (or help-echo-fn #'aq--default-help-echo))
   (local-set-key (kbd "Q") #'aq-abort-fetch)
+  ;; h/H (heart / hearted-only) are always available --- favouriting is a
+  ;; universal affordance, not a per-view opt-in.  The thunk prefers
+  ;; `aq--all-objects' (async path) and falls back to the live vtable's
+  ;; objects (sync path, where that local may be unset).
+  (when (fboundp 'aq--install-hearting)
+    (aq--install-hearting
+     view-name
+     (lambda () (or aq--all-objects
+                    (when-let ((tbl (vtable-current-table))) (vtable-objects tbl))))))
   (when org-fn
     (aq--install-org-marker org-fn)
     (when (fboundp 'aq-agenda-install-keys)
@@ -550,6 +596,7 @@ overrides anything the preset would have defaulted."
                           (t                          (cons name-or-sym vtable-kwargs))))
          (actionable-query-keys        '(:help-echo :prose :prose-bottom :actions :objects
                                          :snooze-period :auto-refresh :group-by :hearting :org
+                                         :org-serializer :no-footer
                                          :async-notifier :insert))
          (vtable-keys       '(:columns :objects-function :getter :formatter :displayer
                                        :use-header-line :face :actions :keymap
@@ -577,6 +624,8 @@ overrides anything the preset would have defaulted."
          (group-by-form     (plist-get vtable-kwargs :group-by))
          (hearting-form     (plist-get vtable-kwargs :hearting))
          (org-form          (plist-get vtable-kwargs :org))
+         (serializer-form   (plist-get vtable-kwargs :org-serializer))
+         (no-footer-form    (plist-get vtable-kwargs :no-footer))
          (notifier-form     (plist-get vtable-kwargs :async-notifier))
          (insert-form       (plist-get vtable-kwargs :insert))
          (rest-kwargs       (let ((rk (cl-loop for (k v) on vtable-kwargs by #'cddr
@@ -586,6 +635,13 @@ overrides anything the preset would have defaulted."
                                 (setq rk (append (list :columns
                                                        (list 'quote aq--fallback-columns))
                                                  rk)))
+                              ;; Run :columns through `aq--coerce-columns' here so
+                              ;; `:editable'/`:setter' are stripped + recorded on
+                              ;; every path (static/sync/async) — `make-vtable'
+                              ;; itself would otherwise choke on the unknown slots.
+                              (setq rk (plist-put (copy-sequence rk) :columns
+                                                  (list #'aq--coerce-columns
+                                                        (plist-get rk :columns))))
                               (unless (plist-member rk :use-header-line)
                                 (setq rk (append (list :use-header-line
                                                        actionable-query-defview-default-use-header-line)
@@ -603,6 +659,8 @@ overrides anything the preset would have defaulted."
                      (objects-spec   (or (plist-get call-kwargs :objects)        ,objects-form))
                      (group-by-fn    (or (plist-get call-kwargs :group-by)       ,group-by-form))
                      (org-fn         (or (plist-get call-kwargs :org)            ,(when org-form `(lambda (it) ,org-form))))
+                     (serializer-fn   (or (plist-get call-kwargs :org-serializer)
+                                          ,serializer-form))
                      (notifier-fn    (or (plist-get call-kwargs :async-notifier) ,(when notifier-form `(lambda () ,notifier-form))))
                      (insert-target (and insert-mode (current-buffer)))
                      ;; Use a marker so subsequent inserts (later sections of a
@@ -610,8 +668,10 @@ overrides anything the preset would have defaulted."
                      ;; don't leave this position pointing inside freshly
                      ;; spliced content.  An integer would silently rot.
                      (insert-pos    (and insert-mode (point-marker)))
+                     ;; Name the buffer after the view's own title, not the
+                     ;; deprecated org-ql-view prefix ("*Org QL View:…").
                      (bufname   ,(if name
-                                     `(format "%s%s*" org-ql-view-buffer-name-prefix ,name)
+                                     `(format "*%s*" ,name)
                                    `"*aq-anon*"))
                      (buf       ,(if name `(get-buffer-create bufname) `(generate-new-buffer bufname)))
                      (snooze    (or (plist-get call-kwargs :snooze-period) ,snooze-form))
@@ -621,17 +681,14 @@ overrides anything the preset would have defaulted."
                                      (let ((max (cdr (func-arity obj-spec))))
                                        (when (or (eq max 'many) (>= max 1))
                                          obj-spec))))
-                     ;; When the call site asks to splice an async view, paint a
-                     ;; ⏳ placeholder in the host *now* so the slot is reserved
-                     ;; in source order.  Without this, every section's prose
-                     ;; lands first and the vtables clump at the end as their
-                     ;; deliveries race.  The placeholder owns marker pair that
-                     ;; `aq--resolve-placeholder' splices into on deliver.
-                     (placeholder (when (and insert-mode insert-target async-fn)
-                                    (aq--insert-pending-placeholder
-                                     insert-target
-                                     :label (format "fetching %s…"
-                                                    ,(or name "view"))))))
+                     ;; When the call site asks to splice an async view, reserve
+                     ;; a ⏳ slot in the host *now* so source-order composition
+                     ;; survives even when deliveries race.  `point-async-reserve'
+                     ;; paints the placeholder synchronously and advances point
+                     ;; past it; the splice happens later, on deliver.  The
+                     ;; *presence* of an async splice is what the rest of the
+                     ;; macro keys off, so we record it as a flag.
+                     (async-splice-p (and insert-mode insert-target async-fn)))
                (with-current-buffer buf
                  (setq aq--marked-rows   nil
                        aq--active-filters nil
@@ -640,15 +697,15 @@ overrides anything the preset would have defaulted."
                  (aq--clear-mark-overlays)
                  (let ((inhibit-read-only t))
                    (erase-buffer)
-                   (org-agenda-mode)
+                   (aq--enter-view-mode)
                    ,@(when prose-form `(,prose-form))
                    (cond
                     (async-fn
-                     ;; Skip the view-buffer hourglass when a host placeholder is
-                     ;; in play — the spinner is rendered in the host instead,
+                     ;; Skip the view-buffer hourglass when a host slot is in
+                     ;; play — the spinner is rendered in the host instead,
                      ;; and the view buffer is purely a staging area whose
                      ;; loading UI the user never sees.
-                     (unless placeholder
+                     (unless async-splice-p
                        (aq--show-loading buf)))
                     ;; Composite views (e.g. `oag-morning-standup') pass
                     ;; `:objects '()' to opt out of vtable rendering — they
@@ -658,17 +715,40 @@ overrides anything the preset would have defaulted."
                     ((and (not (functionp obj-spec)) (null obj-spec))
                      nil)
                     (t
-                     (make-vtable
-                      :objects (if (functionp obj-spec) (funcall obj-spec) obj-spec)
-                      :actions (aq--actions->vtable actions)
-                      :keymap aq--vtable-keymap
-                      ,@rest-kwargs)))
+                     (let ((objs (if (functionp obj-spec) (funcall obj-spec) obj-spec)))
+                       (if (aq--grouped-p objs)
+                           ;; A sync `:objects' may itself return a grouped plist
+                           ;; ("Title" objs "Title2" objs2 …) --- lay it out as
+                           ;; one titled vtable per group, same as the async path.
+                           (aq--render-grouped
+                            (cl-loop for (k v) on objs by #'cddr collect (cons k v))
+                            ,(plist-get rest-kwargs :columns)   ; already coerced upstream
+                            actions
+                            (list ,@(cl-loop for (k v) on rest-kwargs by #'cddr
+                                             unless (eq k :columns) append (list k v)))
+                            ,name)
+                         (apply #'make-vtable
+                                :objects objs
+                                :actions (aq--actions->vtable actions)
+                                :keymap aq--vtable-keymap
+                                (append
+                                 ;; A 0-arg sync thunk is also handed to vtable as
+                                 ;; `:objects-function' --- without this, `g' /
+                                 ;; `vtable-revert-command' silently no-ops for
+                                 ;; every sync-thunk view: vtable only re-funcalls
+                                 ;; `:objects-function' on revert, and the plain
+                                 ;; `:objects' value above is just last render's
+                                 ;; snapshot, not a live source to re-pull from.
+                                 (when (and (functionp obj-spec) (not async-fn))
+                                   (list :objects-function obj-spec))
+                                 (list ,@rest-kwargs)))))))
                    ,@(when prose-bottom-form
                        `((goto-char (point-max)) (insert "\n\n") ,prose-bottom-form)))
                  (setq-local org-ql-view-title ,name)
+                 (setq-local aq--org-serializer serializer-fn)
                  (aq--install-standard-hooks ,name actions help-echo-fn org-fn)
                  (aq--goto-first-row)
-                 (when async-fn
+                 (if async-fn
                    (let* ((real-columns ,(plist-get rest-kwargs :columns))
                           (deliver
                            (aq--make-deliver
@@ -680,7 +760,8 @@ overrides anything the preset would have defaulted."
                                              unless (memq k '(:columns))
                                              append (list k v)))
                             ,(if prose-bottom-form t nil)
-                            org-fn)))
+                            org-fn
+                            ,no-footer-form)))
                      ,@(when hearting-form
                          `((unless aq--all-objects
                              (when (aq--hearted-ids ,name)
@@ -700,20 +781,25 @@ overrides anything the preset would have defaulted."
                                          (aq--update-heart-footer ,name))))))
                      (when notifier-fn
                        (add-hook 'aq--post-deliver-hook notifier-fn nil :local))
-                     ;; Install the splice hook BEFORE cached delivery so the
-                     ;; one-shot fires even when data is already in cache.
-                     ;; Without this, composite views (e.g. oag-morning-standup)
-                     ;; silently render empty sections on every call after the
-                     ;; first.  Markers in the target buffer absorb subsequent
-                     ;; inserts, so multiple sections splice into the right
-                     ;; slots even when their delivers interleave.
-                     (when placeholder
-                       (aq--insert-view-on-deliver-with-placeholder
-                        buf placeholder
-                        :help-echo-fn help-echo-fn
-                        :view-name    ,name
-                        :actions      actions
-                        :async-fn     async-fn))
+                     ;; Reserve a ⏳ slot in the host buffer and install the
+                     ;; splice hook BEFORE cached delivery, so the one-shot
+                     ;; fires even when data is already in cache.  Without
+                     ;; this, composite views (e.g. oag-morning-standup)
+                     ;; silently render empty sections on every call after
+                     ;; the first.  `aq--insert-view-async' paints
+                     ;; synchronously in `insert-target' at point and
+                     ;; advances point past the slot --- so subsequent
+                     ;; sections splice into the right slots even when their
+                     ;; delivers interleave.
+                     (when async-splice-p
+                       (with-current-buffer insert-target
+                         (goto-char insert-pos)
+                         (aq--insert-view-async
+                          buf
+                          :help-echo-fn help-echo-fn
+                          :view-name    ,name
+                          :actions      actions
+                          :async-fn     async-fn)))
                      (when-let ((cached (gethash ,name aq--object-cache)))
                        (funcall deliver cached))
                      (let* ((threshold  actionable-query-auto-fetch-slow-threshold)
@@ -755,39 +841,33 @@ overrides anything the preset would have defaulted."
                                      (setq aq--auto-refresh-timer
                                            (aq--setup-refresh-timer
                                             buf async-fn deliver interval)))))))
-                     (local-set-key (kbd "g") #'actionable-query-refresh-current-view)
-                     (local-set-key
-                      (kbd "R")
-                      (lambda ()
-                        (interactive)
-                        (aq--undismiss-all ,name)
-                        (aq--show-loading buf)
-                        (setq aq--last-fetch-start-time (float-time))
-                        (funcall async-fn deliver)
-                        (message "Snoozed items resurrected."))))
-                   (unless async-fn
+                     (setq aq--resurrect-fn
+                           (lambda ()
+                             (aq--undismiss-all ,name)
+                             (aq--show-loading buf)
+                             (setq aq--last-fetch-start-time (float-time))
+                             (funcall async-fn deliver)
+                             (message "Snoozed items resurrected."))))
+                   (progn
                      (setq aq--refresh-fn
                            (lambda ()
                              (vtable-revert-command)
                              (aq--update-dismissed-footer ,name nil nil)))
-                     (local-set-key (kbd "g") #'actionable-query-refresh-current-view)
-                     (local-set-key
-                      (kbd "R")
-                      (lambda ()
-                        (interactive)
-                        (aq--undismiss-all ,name)
-                        (vtable-revert-command)
-                        (aq--update-dismissed-footer ,name nil nil)
-                        (message "Snoozed items resurrected."))))
-                   (goto-char (point-min)))
+                     (setq aq--resurrect-fn
+                           (lambda ()
+                             (aq--undismiss-all ,name)
+                             (vtable-revert-command)
+                             (aq--update-dismissed-footer ,name nil nil)
+                             (message "Snoozed items resurrected.")))))
+                 (goto-char (point-min))
                  (if (not insert-mode)
                      (pop-to-buffer buf org-ql-view-display-buffer-action)
-                   ;; Async views own a `placeholder' — its resolver runs on
-                   ;; deliver and splices the rendered content in via
-                   ;; `aq--resolve-placeholder', so we skip the synchronous
-                   ;; path here.  Without a placeholder we're in the
+                   ;; Async views own a `point-async' slot — its resolver
+                   ;; runs on deliver and splices the rendered content via
+                   ;; `aq--insert-view-async', so we skip the synchronous
+                   ;; path here.  Without an async slot we're in the
                    ;; non-async / cached-content branch — splice now.
-                   (unless placeholder
+                   (unless async-splice-p
                      (aq--splice-view-into buf insert-target insert-pos
                                            :help-echo-fn help-echo-fn
                                            :view-name    ,name
@@ -802,9 +882,34 @@ overrides anything the preset would have defaulted."
                 (put ',sym 'function-documentation
                      (format "Open the \"%s\" actionable-query view, or insert it at point.
 Plist call form: (NAME :insert t/'fetch-latest [:help-echo \\='\\='] [:actions \\='\\='] \\='\\=')." ,name))))
-          ;; `C-x C-e' on the macro form Does The Right Thing: opens the
-          ;; dedicated buffer (or splices, if `:insert' is set).
-          (funcall view-fn ,@(when insert-form `(:insert ,insert-form))))))
+          )))
+
+;;; ─── C-x C-e: open the view buffer after defining it ────────────────────────
+;;
+;; `define-C-x-C-e-extension' fires after interactive eval only (when
+;; `load-file-name' is nil), so defining a view at startup is silent ---
+;; no buffer opens until the user actively evaluates the form.
+
+(require 'fancy-C-x-C-e)
+
+(define-C-x-C-e-extension actionable-query-defview (head-or-name &rest _rest)
+  "After \\[eval-last-sexp] on an `actionable-query-defview' form, open the view.
+The view name is extracted from the form's argument structure:
+  (defview SYM \"Title\" …) — name is the string \"Title\" (third element).
+  (defview \"Title\" …)    — name is the string head.
+  (defview :kw …)          — anonymous; no buffer to open."
+  :named aq--defview-C-x-C-e-ext
+  (let ((view-name
+         (cond
+          ;; (defview SYM "Title" ...) — symbol head, title is next
+          ((and (symbolp head-or-name) (not (keywordp head-or-name)))
+           (car _rest))
+          ;; (defview "Title" ...) — string head is the title
+          ((stringp head-or-name) head-or-name)
+          ;; keyword head means anonymous view
+          (t nil))))
+    (when (stringp view-name)
+      (org-ql-view view-name))))
 
 (require 'actionable-query-scheduler)
 (require 'agenda)

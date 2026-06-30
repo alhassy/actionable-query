@@ -55,8 +55,21 @@ Works from cells, header lines, prose, and footers alike."
     (user-error "No actionable-query view refresh fn in this buffer")))
 
 (defun aq--obj-id (o)
-  "Return a stable dismissal ID for object O: its :url if a plist, else O itself."
-  (or (plist-get o :url) o))
+  "Return a stable identity for object O, used for dismissal + hearting.
+Prefers an explicit `:id', then `:url'; falls back to O itself.  A view whose
+row plists gain/lose fields over time (e.g. a contact that later carries its
+last-message snippet) MUST set a stable `:id' --- otherwise the whole-plist
+fallback changes and previously-hearted/dismissed rows stop matching."
+  (or (plist-get o :id) (plist-get o :url) o))
+
+(defun aq--obj-label (o)
+  "A human-readable label for object O, for confirmation messages.
+Prefers a name-ish plist key (`:name'/`:title'/`:heading'/`:subject'); falls
+back to the stable id from `aq--obj-id'.  So `h' on a contact reports the
+person's name rather than an opaque jid."
+  (or (and (consp o) (or (plist-get o :name) (plist-get o :title)
+                         (plist-get o :heading) (plist-get o :subject)))
+      (format "%s" (aq--obj-id o))))
 
 (provide 'aq-state-cache)
 ;;; aq-state-cache.el ends here

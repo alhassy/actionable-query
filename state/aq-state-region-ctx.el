@@ -30,7 +30,13 @@ Set transiently by actions (e.g. `r') that want their confirmation to remain vis
   async-fn            ; non-nil when the view fetches asynchronously.
   (filters nil)       ; alist (column-name . regex) — per-region.
   (marked-rows nil)   ; list of vtable row objects marked in this region.
-  (mark-overlays nil)); list of overlays giving visual mark feedback.
+  (mark-overlays nil) ; list of overlays giving visual mark feedback.
+  (editable-setters nil)   ; alist (column-index . setter-fn); mirrors the view
+                           ; buffer's `aq--editable-setters' so `e' edits cells
+                           ; in a splice without that buffer-local being present.
+  (show-hearted-only nil)); per-region `H' toggle; the buffer-local
+                          ; `aq--show-hearted-only' is wrong when several views
+                          ; share one host buffer.
 
 (defun aq--ctx-at-point ()
   "Return the `aq-region-ctx' covering point, or nil when point is outside any."

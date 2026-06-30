@@ -263,8 +263,7 @@ lazily fetched on demand by `amail--imap-open-body' on cache miss."
                                  (amail--sanitize-email-from (plist-get o :from)))
                     :formatter (lambda (v &rest _)
                                  (propertize v 'face '(:foreground "forest green" :weight bold))))
-             (:name "Subject"
-                    :width 55
+             (:name "Subject"  ; no :width -> vtable sizes to the widest subject
                     :getter (lambda (o &rest _) (or (plist-get o :subject) ""))))
   :objects  #'amail--imap-fetch-inbox
   ;; :snooze-period 'forever
