@@ -52,11 +52,11 @@ splice — re-running it does the fetch (or hits the cache) and goes
 through the same splice path, which builds a *fresh* `aq-region-ctx'
 covering the new content.
 
-Markers handle the position math: `begin' has the default
-`insertion-type' (nil, so it stays put when text is inserted at it)
-and `end' has `insertion-type' t (so it slides forward as the new
-content is inserted).  After the dance, both refer to the bounds of
-the freshly rendered region."
+`begin'/`end' are used only to delete the old region; the re-run
+view-fn captures fresh markers for the new content, so this never
+reuses them post-insert.  Both are insertion-type nil so a sibling
+view appending below `end' does not drag it forward (which would
+make `end' creep to point-max and delete every view below)."
   (let* ((view-name (aq-region-ctx-view-name ctx))
          (begin     (aq-region-ctx-begin ctx))
          (end       (aq-region-ctx-end ctx))

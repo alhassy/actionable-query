@@ -92,10 +92,60 @@ so titles never truncate, without mutating the shared column defvar."
   :org-ql (tags "inbox")
   :columns (dashboard--unwidth aq-org-ql-columns "Heading"))
 
+(defun dashboard--deadline-days (ts)
+  "Whole days from today until org timestamp string TS, or nil.
+Negative once the deadline is past."
+  (when (and ts (string-match "[0-9]\\{4\\}-[0-9][0-9]-[0-9][0-9]" ts))
+    (- (org-time-string-to-absolute (match-string 0 ts))
+       (org-today))))
+
+(defun dashboard--subtree-progress (marker)
+  "Return (DONE . TOTAL) descendant TODO entries under MARKER's tree, or nil.
+Mirrors org's own statistics-cookie counting --- every descendant heading
+with a TODO keyword counts, and those in a done state are complete."
+  (when (and (markerp marker) (marker-buffer marker))
+    (org-with-point-at marker
+      (org-back-to-heading t)
+      (let ((self (point)) (done 0) (total 0))
+        (org-map-entries
+         (lambda ()
+           (unless (= (point) self)
+             (when (org-get-todo-state)
+               (setq total (1+ total))
+               (when (org-entry-is-done-p) (setq done (1+ done))))))
+         nil 'tree)
+        (cons done total)))))
+
+(defun dashboard--top-goal-help-echo (o)
+  "Help-echo for a top-goal row: days-to-deadline + subtree completion %."
+  (let* ((days (dashboard--deadline-days (plist-get o :deadline)))
+         (prog (dashboard--subtree-progress (plist-get o :marker)))
+         (done (car prog)) (total (cdr prog)))
+    (string-join
+     (delq nil
+           (list
+            (when days
+              (cond ((< days 0)  (format "⚠️ Deadline was %d day%s ago!" (abs days) (if (= 1 (abs days)) "" "s")))
+                    ((= days 0)  "⏰ Deadline is TODAY.")
+                    (t           (format "%d day%s until the deadline." days (if (= 1 days) "" "s")))))
+            (when (and prog (> total 0))
+              (format "%d%% complete (%d/%d sub-tasks done)."
+                      (round (* 100.0 (/ done (float total)))) done total))
+            (when (and prog (zerop total))
+              "No sub-tasks yet --- break this goal down.")))
+     "  ")))
+
 (actionable-query-defview dashboard/top-goals "⚡ Top goals for the month"
   :org-ql (tags-local "Top")
-  :columns (mapcar (lambda (col) (plist-put (copy-sequence col) :name ""))
-                    (dashboard--unwidth (butlast aq-org-ql-columns) "Heading")))
+  ;; Just Heading + a self-labelled date --- no Todo/Pri/Tags clutter.
+  :columns '((:name "" :getter (lambda (o &rest _) (plist-get o :heading)))
+             (:name "" :getter (lambda (o &rest _)
+                                 (cond ((plist-get o :deadline)
+                                        (format "Deadline: %s" (plist-get o :deadline)))
+                                       ((plist-get o :scheduled)
+                                        (format "Scheduled: %s" (plist-get o :scheduled)))
+                                       (t "")))))
+  :help-echo #'dashboard--top-goal-help-echo)
 
 (actionable-query-defview dashboard/overdue "📆 Overdue"
   :org-ql (and (not (habit)) (not (tags "Top")) (not (done))
@@ -1252,13 +1302,27 @@ Set in private.el, e.g. \"https://app.slack.com/client/TXXXX/CYYYY\".")
   "Case-insensitive regexp for non-work calendar items to omit from the standup.")
 
 (defun dashboard--standup-shareable-p (o)
-  "Non-nil when calendar row O belongs in the standup: a timed work item, sans noise."
-  (let ((title (or (plist-get o :title) "")))
-    (and (plist-get o :start)                       ; timed
-         (or (dashboard--work-item-p o)
-             (dashboard--working-hours-p o))
-         (not (let ((case-fold-search t))
-                (string-match-p dashboard--standup-noise-rx title))))))
+  "Non-nil when timed calendar row O belongs in the standup.
+Rituals (matching `dashboard--standup-noise-rx') and the `⟨ 𝒩ℴ𝓌 ⟩' marker are
+always excluded.  Past that:
+ - Org-backed rows (a live `:marker') are real tasks --- FWD/Gerrit work minted
+   via RET/C-c C-s --- so they qualify at *any* hour (an early deep-work block
+   shouldn't be dropped just for starting before 8am).
+ - Markerless gcal meetings qualify only within working hours (8am-4pm)."
+  (let* ((title (or (plist-get o :title) ""))
+         ;; A standup-shaped work line carries a `::' action or a ticket link;
+         ;; such rows are exempt from the ritual noise-rx, so a ticket whose
+         ;; title merely contains a noise word (e.g. "family ethernet-switching")
+         ;; isn't mistaken for a ritual.
+         (work-shaped (string-match-p "::\\|FWD-[0-9]\\|BUG-[0-9]\\|\\[\\[" title)))
+    (and (plist-get o :start)                           ; timed
+         (not (plist-get o :now))                       ; not the ⟨ 𝒩ℴ𝓌 ⟩ marker
+         (or work-shaped
+             (not (let ((case-fold-search t))           ; rituals: only when not work-shaped
+                    (string-match-p dashboard--standup-noise-rx title))))
+         (or (let ((m (plist-get o :marker)))            ; org-backed task → any hour
+               (and (markerp m) (marker-buffer m)))
+             (dashboard--working-hours-p o)))))          ; gcal meeting → 8am-4pm
 
 (defun dashboard--standup-heading-line (o)
   "Org heading text for row O, preferring its node's headline over the calendar title.
@@ -1351,16 +1415,28 @@ every section on every call."
         ;; Drop the clock vtable's trailing newline so the weather vtable
         ;; splices onto the *same* line:  🇯🇵 … 🇮🇳 …  🌤️ 20°C 68°F
         (when (eq (char-before) ?\n) (delete-char -1))
-        (insert "  ")
+        (insert " ~  ")
         (dashboard/weather :insert reuse-cache)
-        (insert "\n\n"
-                (dashboard--heading-link 'dashboard/top-goals "⚡ Top goals for the month") "\n\n")
-        (dashboard/top-goals :insert reuse-cache)
+        (insert "\n\n")
+        ;; Center the top-goals heading + its rows: org-ql is synchronous (its
+        ;; splice lands before the call returns), so the region from here to
+        ;; point after the view covers the rendered content.
+        (let ((goals-start (point)))
+          (insert (dashboard--heading-link 'dashboard/top-goals "⚡ Top goals for the month") "\n")
+          (dashboard/top-goals :insert reuse-cache)
+          ;; `center-region' centers within `fill-column' (default 80), too
+          ;; narrow for these wide lines; bind it to the display width so they
+          ;; center across the whole window (falling back to the frame when the
+          ;; dashboard isn't shown in a window yet).
+          (let ((fill-column (if-let ((w (get-buffer-window (current-buffer))))
+                                 (window-width w)
+                               (frame-width))))
+            (center-region goals-start (point))))
         (insert "\n\n/Ensure what you're working on is in service of these goals ---or change the goals!/\n\n")
 
         (dashboard/work-calendar :insert reuse-cache)
 
-        (insert "* 📩 Process Inbox\n\n** "
+        (insert "\n* 📩 Process Inbox\n\n** "
                 (dashboard--heading-link 'whatsapp/contacts "🫶 Social Connection") "\n\n")
         (insert "---Reach out to someone today; relationships need tending. Press `d' to send a greeting.---\n\n")
         (whatsapp/contacts :insert reuse-cache)

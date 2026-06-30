@@ -75,9 +75,16 @@ other default bindings (S, {, }, M-<left>, M-<right>) keep working.")
 If the row has no Org heading yet, one is created (via
 `aq-agenda--marker-or-create', honouring the view's `:org-serializer')
 and the row's marker updated --- so RET always lands you on a real tree,
-no per-view RET binding needed."
+no per-view RET binding needed.
+
+Acts only on real data rows.  On a non-row line (a group heading, prose,
+blank line) there is no `vtable-object', so rather than mint a spurious tree
+we fold the section via `org-cycle' --- restoring the expected TAB behaviour."
   (interactive)
-  (let ((m (if (fboundp 'aq-agenda--marker-or-create)
+  (if (not (and (fboundp 'vtable-current-object) (vtable-current-object)))
+      ;; Not on a data row: behave like TAB (fold the section).
+      (when (fboundp 'org-cycle) (org-cycle))
+   (let ((m (if (fboundp 'aq-agenda--marker-or-create)
                (aq-agenda--marker-or-create)
              ;; Fallback if agenda.el isn't loaded: marker from the row only.
              (when-let* ((obj (and (fboundp 'vtable-current-object) (vtable-current-object)))
@@ -85,10 +92,14 @@ no per-view RET binding needed."
                mk))))
     (if (and (markerp m) (marker-buffer m))
         (progn (pop-to-buffer (marker-buffer m))
+               ;; Widen if narrowed --- the heading may sit outside the active
+               ;; restriction (e.g. a narrowed my-life.org), so jumping there
+               ;; would otherwise land on hidden or wrong content.
+               (when (buffer-narrowed-p) (widen))
                (goto-char m)
                (when (fboundp 'org-fold-show-context) (org-fold-show-context))
                (recenter))
-      (message "No Org entry for this row"))))
+      (message "No Org entry for this row")))))
 
 (defvar-local aq--resurrect-fn nil
   "Buffer-local closure that un-snoozes this view and re-renders.

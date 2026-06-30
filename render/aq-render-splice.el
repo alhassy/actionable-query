@@ -131,7 +131,12 @@ buffer-local `aq--editable-setters' the dedicated buffer relies on is
 absent in a host buffer."
   (interactive)
   (if-let ((ctx (aq--ctx-at-point)))
-      (aq--edit-current-cell-1 (aq-region-ctx-editable-setters ctx))
+      ;; A bare `vtable-revert' redraws only the table's own region, leaving
+      ;; the spliced view as raw org text in the host buffer (and never
+      ;; recomputes sibling cells off the edit).  Re-render the whole region
+      ;; instead --- the same repaint every other splice command relies on.
+      (aq--edit-current-cell-1 (aq-region-ctx-editable-setters ctx)
+                               (lambda () (aq--rerender-region ctx)))
     (user-error "Not inside a spliced view")))
 
 (defun aq-region-toggle-heart ()
@@ -286,17 +291,19 @@ source order rather than collapsing in reverse."
       (put-text-property 0 (length content) 'aq--help-echo help-echo-fn content))
     ;; 4.  Insert into the host, then build markers around the new
     ;;     content and attach the full `aq-region-ctx' as a property
-    ;;     over the span.  `begin' has default insertion-type (nil:
-    ;;     stays put when text is inserted at it) and `end' is type-t
-    ;;     (slides forward as content is appended) — exactly what
-    ;;     `aq--rerender-region' relies on.
+    ;;     over the span.  Both markers are insertion-type nil so the
+    ;;     region stays put under the *sibling* views that append below
+    ;;     it: `begin' stays before its content, and crucially `end'
+    ;;     stays at *this* view's end rather than sliding forward with
+    ;;     every later insert (which would make `end' creep to point-max
+    ;;     and have `aq--rerender-region' delete every view below).
     (with-current-buffer target-buf
       (goto-char pos)
       (let ((inhibit-read-only t)
             (begin (copy-marker pos))
             end)
         (insert content)
-        (setq end (copy-marker (point) t))
+        (setq end (copy-marker (point) nil))
         (when view-name
           ;; Carry the view buffer's editable setters onto the ctx so `e'
           ;; (via `aq-region-edit-cell') can edit cells in the host buffer,

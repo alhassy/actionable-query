@@ -35,12 +35,17 @@
 (declare-function vtable--get-value      "vtable")
 (defvar aq--editable-setters)            ; defvar-local in aq-interaction-filters
 
-(defun aq--edit-current-cell-1 (setters)
+(defun aq--edit-current-cell-1 (setters &optional redraw)
   "Edit the cell at point using SETTERS, an alist (column-index . setter-fn).
 Signals a `user-error' when the current column has no setter in SETTERS.
 The dedicated-buffer path passes the buffer-local `aq--editable-setters';
 the splice path passes the copy carried on the region's `aq-region-ctx',
-so one implementation serves both."
+so one implementation serves both.
+
+REDRAW, if given, is called after the setter to repaint --- the splice
+path passes `aq--rerender-region' so the whole host region (org text +
+every recomputed peer cell) is rebuilt.  When omitted, the dedicated
+buffer's `vtable-revert' suffices."
   (let* ((table  (vtable-current-table))
          (idx    (vtable-current-column))
          (col    (and idx (elt (vtable-columns table) idx)))
@@ -52,12 +57,14 @@ so one implementation serves both."
     (let* ((current (vtable--get-value object idx col table))
            (new     (read-string (format "%s: " name) (format "%s" current))))
       (funcall setter object new)
-      ;; `vtable-revert' alone reuses cached line renderings --- the
-      ;; interactive `vtable-revert-command' clears the cache first for
-      ;; the same reason; without this, a `:setter' mutating a sibling
-      ;; row's plist in place never shows up on screen.
-      (vtable--clear-cache table)
-      (vtable-revert))))
+      (if redraw
+          (funcall redraw)
+        ;; `vtable-revert' alone reuses cached line renderings --- the
+        ;; interactive `vtable-revert-command' clears the cache first for
+        ;; the same reason; without this, a `:setter' mutating a sibling
+        ;; row's plist in place never shows up on screen.
+        (vtable--clear-cache table)
+        (vtable-revert)))))
 
 (defun aq--edit-current-cell ()
   "Edit the cell at point, if its column is `:editable' (dedicated-buffer `e').
