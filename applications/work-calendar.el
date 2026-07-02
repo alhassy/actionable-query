@@ -742,7 +742,7 @@ SCHEDULED, then refreshes keeping point on the row."
   :objects #'dashboard--calendar-items
   ;; Org-backed rows expose their marker so C-c C-s / t / : etc. work; gcal
   ;; rows have no marker and stay link-only.
-  :org (lambda (o) (plist-get o :marker))
+  :org-deserializer (lambda (o) (plist-get o :marker))
   ;; When an agenda key mints a tree from a gcal row, name it after the event
   ;; and prefill SCHEDULED (today @ start) + Zoom/location/attendees.
   :org-serializer #'dashboard--calendar-serializer

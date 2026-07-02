@@ -130,7 +130,7 @@ refreshes, and =q= buries the buffer, all with zero extra wiring.
 
 - *How do I get clock-in, scheduling, TODO cycling, and all the other
   org-agenda commands working on arbitrary rows?*
-  ~agenda.el~ closes that gap: any view with ~:org~ wired up gets the full
+  ~agenda.el~ closes that gap: any view with ~:org-deserializer~ wired up gets the full
   suite of org-agenda actions automatically — including auto-creating an Org
   heading in ~org-default-notes-file~ when none exists yet.
 
@@ -636,30 +636,51 @@ When ~t~, enables:
 Hearts are persisted via =savehist= and survive restarts. On open, the
 view defaults to hearted-only when any hearts exist for that view name.
 
-** ~:org~ — link rows to Org headings
+** ~:org-deserializer~ — link rows to *existing* Org headings
 
-A ~(lambda (it) …)~ returning an org marker or nil. On each cursor
-move the lambda is called; when it returns a live marker, ~org-marker~
-and ~org-hd-marker~ are set on that line — enabling standard
-~org-agenda-mode-map~ navigation (~RET~, ~TAB~, ~I~, ~o~) to jump to
-the linked Org heading.
+The dual of ~:org-serializer~ (which *serializes* a row into a **new** Org
+tree): ~:org-deserializer~ *deserializes* a row back to the **existing** Org
+tree it already belongs to.  It is a ~(lambda (row) …)~ returning that tree's
+marker (or nil).  On each cursor move the lambda is called; when it returns a
+live marker, ~org-marker~ and ~org-hd-marker~ are set on that line — enabling
+standard ~org-agenda-mode-map~ navigation (~RET~, ~TAB~, ~I~, ~o~) to jump to
+the linked heading.
 
-Setting ~:org~ also activates the full org-agenda command suite from
-~agenda.el~ — clock in/out, schedule, deadline, TODO cycling, priority,
-tags, effort, archive, and kill subtree — all on the standard keys.
-If the current row has no existing Org heading, one is created
-automatically in ~org-default-notes-file~.
+(The keyword was formerly ~:org-deserializer~; that name is still accepted as an alias.)
+
+Setting ~:org-deserializer~ also activates the full org-agenda command suite
+from ~agenda.el~ — clock in/out, schedule, deadline, TODO cycling, priority,
+tags, effort, archive, and kill subtree — all on the standard keys.  If the
+current row has no existing heading, one is created automatically in
+~org-default-notes-file~ (using ~:org-serializer~'s spec for the title/body
+when supplied).
 
 #+begin_src emacs-lisp
-:org (lambda (o) (org-find-exact-headline-in-buffer (plist-get o :title)))
+:org-deserializer (lambda (o) (org-find-exact-headline-in-buffer (plist-get o :title)))
 #+end_src
+
+*** The clever case: content-join by a shared key
+
+~:org-deserializer~ itself is deliberately dumb — it just returns whatever
+marker you hand it.  The *interesting* resolution lives one layer down, in
+~actionable-query-resolve-org-markers~ (next), which a view calls once to build
+a ~row → marker~ hash; ~:org-deserializer~ then just reads that cache O(1).
+
+By way of example: the Gerrit/Jira views never store an Org id anywhere.  A
+freshly-fetched Gerrit change carries a Jira ticket like ~FWD-55732~; the
+resolver scans ~org-default-notes-file~ for the *first heading whose text
+contains that string* and calls that your tree.  So an incoming work-item
+"finds its home" purely because you once wrote ~* TODO FWD-55732 …~ — the
+ticket number **is** the join key.  No stamping, no bookkeeping, no drift:
+rename or move the heading freely, and the association still holds as long as
+the ID appears in it.
 
 *** ~actionable-query-resolve-org-markers~ — batch Org heading lookup
 
 When a view shows objects that correspond to Org headings (Jira tickets, git
 branches, project names), resolving the marker for each object is the same
 two-pass boilerplate every view duplicates.  ~actionable-query-resolve-org-markers~
-runs it once and returns a hash-table you can feed straight into ~:org~:
+runs it once and returns a hash-table you feed straight into ~:org-deserializer~:
 
 #+begin_src emacs-lisp
 (defun actionable-query-resolve-org-markers (objects key-fn &optional fallback-fn)
@@ -678,7 +699,7 @@ heading containing that string; store ~point-marker~ in the table.
 without a marker, if ~fallback-fn~ is non-nil.
 
 Typical wiring — call it once (e.g. in the async deliver callback), stash
-the table in a plain variable, then read from it O(1) in ~:org~:
+the table in a plain variable, then read from it O(1) in ~:org-deserializer~:
 
 #+begin_src emacs-lisp
 (defvar my-org-cache (make-hash-table :test 'eq))
@@ -690,9 +711,10 @@ the table in a plain variable, then read from it O(1) in ~:org~:
                 (setq my-org-cache
                       (actionable-query-resolve-org-markers
                        items
+                       ;; KEY-FN: the shared string that joins a row to a heading.
                        (lambda (o) (plist-get o :jira-id))))
                 (funcall cb items))))
-  :org (lambda (o) (gethash o my-org-cache))
+  :org-deserializer (lambda (o) (gethash o my-org-cache))
   ...)
 #+end_src
 
@@ -747,7 +769,7 @@ Every =actionable-query-defview= buffer gets these automatically:
 | ~?~            | Transient popup of all actions + commands                   |
 | ~q~            | Bury buffer                                                 |
 
-When ~:org~ is set, the following org-agenda keys are also available
+When ~:org-deserializer~ is set, the following org-agenda keys are also available
 (see [[*Org-agenda command parity (~agenda.el~)]]):
 
 | Key        | Action                              |
@@ -802,7 +824,7 @@ Explicit kwargs at the call site always override preset defaults.
 
 * Org-agenda command parity (~agenda.el~)
 
-=agenda.el= is loaded automatically and makes any view with ~:org~
+=agenda.el= is loaded automatically and makes any view with ~:org-deserializer~
 a drop-in replacement for =org-agenda=.  Every org-agenda command
 delegates through a thin wrapper that:
 
@@ -833,12 +855,12 @@ The preset expands to:
 
 - ~:objects~ — a 0-arg thunk running ~org-ql-select~ across ~org-agenda-files~
   with the ~element-with-markers~ action (so each row carries live Org markers).
-- ~:org~ — extracts ~:org-hd-marker~ from each element, wiring up all
+- ~:org-deserializer~ — extracts ~:org-hd-marker~ from each element, wiring up all
   org-agenda keys automatically.
 - ~:columns~ — sane defaults: TODO keyword, priority, headline, scheduled date, tags.
 - ~:actions~ — ~RET~ jumps to the heading in another window.
 
-Because ~:org~ is set, every org-agenda key (~I~, ~t~, ~C-c C-s~, …) works
+Because ~:org-deserializer~ is set, every org-agenda key (~I~, ~t~, ~C-c C-s~, …) works
 out of the box, and the view gains all the actionable-query affordances on
 top: hover info, snoozing, bulk actions, column filters, ~?~ transient, etc.
 
@@ -860,7 +882,7 @@ Override it globally or per-view:
 
 ** Auto-creating Org headings on demand
 
-When a non-~:org-ql~ view has ~:org~ set and the current row maps to no
+When a non-~:org-ql~ view has ~:org-deserializer~ set and the current row maps to no
 existing heading, pressing any agenda key (~I~, ~C-c C-s~, ~t~, …)
 triggers ~aq-agenda--ensure-marker~:
 

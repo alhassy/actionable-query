@@ -48,6 +48,12 @@ SETTER-FN is `(lambda (object new-value) …)', called by
 (defvar-local aq--all-objects nil
   "Full unfiltered object list from the last async delivery; used by column filters.")
 
+(defvar-local aq--visible-objects nil
+  "The rows actually rendered into the vtable --- `aq--all-objects' minus
+dismissed/snoozed rows and after column/hearted filters.  Distinct from
+`aq--all-objects' (which stays the full set for `=' filtering); read by the
+`:on-inserted' hook to judge whether a section is visually empty.")
+
 (defun aq--coerce-columns (cols)
   "Coerce COLS (strings, plists, or vtable-column structs) to vtable-column objects.
 Plists may carry `:editable' and `:setter' — `vtable-column' has no such

@@ -77,10 +77,37 @@ BODY may be nil.  TITLE is nil when SPEC is malformed."
       (list (and (stringp title) title) (nreverse props) body)))
    (t (list nil nil nil))))
 
+(declare-function aq--ctx-at-point "state-region-ctx")
+(declare-function aq-region-ctx-org-serializer "state-region-ctx")
+
 (defun aq--row-serializer-spec (obj)
-  "Run the view's `:org-serializer' on row OBJ, returning its raw SPEC or nil."
-  (when (and (bound-and-true-p aq--org-serializer) (consp obj))
-    (funcall aq--org-serializer obj)))
+  "Run the view's `:org-serializer' on row OBJ, returning its raw SPEC or nil.
+In a dedicated view buffer the serializer is the buffer-local
+`aq--org-serializer'; in a spliced host buffer that buffer-local is
+absent, so we fall back to the one carried on the region's
+`aq-region-ctx' --- keeping RET / C-c C-s / I heading-minting identical
+whether the view is standalone or spliced into the dashboard."
+  ;; OBJ is a row object --- a plist (cons) for org-ql views, or a
+  ;; `cl-defstruct' record (e.g. `org-agenda-gerrit-item') for gerrit views.
+  ;; Accept both; only a bare nil/atom row has nothing to serialize.
+  (when (or (consp obj) (recordp obj))
+    (when-let ((ser (or (and (bound-and-true-p aq--org-serializer) aq--org-serializer)
+                        (when-let ((ctx (and (fboundp 'aq--ctx-at-point)
+                                             (aq--ctx-at-point))))
+                          (aq-region-ctx-org-serializer ctx)))))
+      (funcall ser obj))))
+
+(defun aq-row-scheduled-on-or-after-today-p (obj org-fn)
+  "Non-nil when OBJ's Org heading (resolved via ORG-FN) is SCHEDULED today or later.
+ORG-FN is the view's `:org-deserializer' (marker- or key-string-returning); we
+resolve it through `aq-org-marker-of' so the content-join case works too.  A row
+that is unscheduled, or scheduled in the past (overdue), returns nil --- those
+still warrant attention, so a section holding them should stay visible."
+  (when-let* ((m  (aq-org-marker-of obj org-fn))
+              ((markerp m))
+              ((marker-buffer m))
+              (ts (org-with-point-at m (org-get-scheduled-time (point)))))
+    (>= (time-to-days ts) (org-today))))
 
 (defun aq-agenda--ensure-marker (obj title-string)
   "Return a live Org marker for OBJ, creating a heading if none exists.

@@ -67,6 +67,35 @@ Suppressed while `aq--suppress-help-echo-until' is in the future."
 (defvar-local aq--last-org-marker-obj nil
   "Most-recently processed vtable object for org-marker; skips redundant `funcall org-fn' calls.")
 
+(defvar-local aq--org-key-marker-cache nil
+  "Lazily-built `row → marker' hash for a string-valued `:org-deserializer'.
+When `:org-deserializer' returns a STRING for a row (a content-join key such
+as a Jira ID rather than a marker), `aq-org-marker-of' resolves the whole
+current object batch once via `actionable-query-resolve-org-markers' and caches
+it here, so per-cursor lookups stay O(1) instead of re-scanning the notes file.")
+
+(defun aq-org-marker-of (obj org-fn)
+  "Return the live Org marker OBJ maps to under ORG-FN, or nil.
+ORG-FN (the view's `:org-deserializer') may return either:
+  • a live marker  → used directly (the row already knows its heading); or
+  • a STRING        → a content-join key (e.g. a Jira ID) matched against
+                      headings in `org-default-notes-file'.  The whole current
+                      batch (`aq--all-objects') is resolved once by
+                      `actionable-query-resolve-org-markers' and cached in
+                      `aq--org-key-marker-cache', so this stays O(1) per call.
+This is what lets a view hand core a bare key-fn and drop its own marker cache."
+  (when (functionp org-fn)
+    (let ((v (funcall org-fn obj)))
+      (cond
+       ((markerp v) v)
+       ((stringp v)
+        (unless aq--org-key-marker-cache
+          (setq aq--org-key-marker-cache
+                (actionable-query-resolve-org-markers
+                 (or aq--all-objects (list obj)) org-fn)))
+        (gethash obj aq--org-key-marker-cache))
+       (t nil)))))
+
 (defun aq--install-org-marker (org-fn)
   "Install a post-command hook that sets org-marker on the current vtable row.
 ORG-FN is (lambda (it) …) returning an org marker or nil.  When a live
@@ -78,7 +107,7 @@ navigation (RET, TAB, I, o) to jump to the linked Org heading."
               (when-let ((obj (vtable-current-object)))
                 (unless (eq obj aq--last-org-marker-obj)
                   (setq aq--last-org-marker-obj obj)
-                  (when-let* ((marker (funcall org-fn obj))
+                  (when-let* ((marker (aq-org-marker-of obj org-fn))
                               ((and (markerp marker) (marker-buffer marker))))
                     (let ((inhibit-read-only t))
                       (put-text-property (line-beginning-position)

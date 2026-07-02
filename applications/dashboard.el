@@ -4,13 +4,13 @@
 ;;
 ;;   ⚡ Top goals for the month  -- org-ql, no heading, right under the title
 ;;   * 📩 Process Inbox          -- Email, Quick Captures, RSS
-;;   * 📋 Urgent and unstarted   -- Priority A unscheduled (org-ql)
 ;;                                + Whom am I blocking? / Feedback I need
 ;;                                  to address (+ Waiting on others, nested)
 ;;                                  (org-agenda-gerrit.el lenses 1 & 2)
 ;;   * 📆 Planning               -- Jira urgent-not-started, Jira-vs-Gerrit
 ;;                                disagreement, Overdue (deadline + scheduled,
 ;;                                nested), Reduce open loops, Gerrit: WIP
+;;   * 📋 Urgent and unstarted   -- Priority A unscheduled (org-ql)
 ;;
 ;; splicing `actionable-mail/gmail-inbox' (actionable-mail.el),
 ;; `dashboard/rss-feeds' (on top of actionable-query/data/aq-data-rss.el),
@@ -212,6 +212,29 @@ Clicking re-runs (VIEW :insert \\='fetch-latest), re-rendering just that
 section's vtable."
   (format "[[elisp:(funcall-interactively '%s)][%s]]" view label))
 
+(defun dashboard--section-hideable-p (objects org-fn)
+  "Non-nil when a section holding OBJECTS should be omitted from the dashboard.
+True when there are no OBJECTS at all, or when *every* row is already
+scheduled today-or-later (via ORG-FN) --- nothing there needs action now.
+A row that is unscheduled or overdue keeps the section (returns nil)."
+  (or (null objects)
+      (seq-every-p (lambda (o) (aq-row-scheduled-on-or-after-today-p o org-fn))
+                   objects)))
+
+(defun dashboard--hider (reuse-cache start)
+  "Return an `:on-inserted' closure that omits a section when hideable.
+START is a marker at the section's first char (before its heading).  When
+REUSE-CACHE is `t' and the delivered rows are empty / all-scheduled (see
+`dashboard--section-hideable-p'), the closure deletes START..END --- the
+whole section: heading, prose, table, footer.  Returns nil on `fetch-latest'
+so nothing is hidden (the view then gets `:on-inserted nil')."
+  (when (eq reuse-cache t)
+    (lambda (objs _beg end org-fn)
+      (when (dashboard--section-hideable-p objs org-fn)
+        (let ((inhibit-read-only t))
+          (delete-region start end)
+          (goto-char start))))))
+
 (defun dashboard (&optional force-fresh)
   "Open (or refresh) the *Dashboard* buffer.
 With a prefix arg (`C-u M-x dashboard'), bypass each view's slow-fetch
@@ -253,55 +276,90 @@ every section on every call."
 
         (dashboard/work-calendar :insert reuse-cache)
 
-        (insert "\n* 📩 Process Inbox\n\n** "
-                (dashboard--heading-link 'whatsapp/contacts "🫶 Social Connection") "\n\n")
-        (insert "---Reach out to someone today; relationships need tending. Press `d' to send a greeting.---\n\n")
-        (whatsapp/contacts :insert reuse-cache)
-        (insert "\n\n** "
-                (dashboard--heading-link 'actionable-mail/gmail-inbox "Email") "\n\n")
-        (actionable-mail/gmail-inbox :insert reuse-cache)
-        (insert "\n\n** " (dashboard--heading-link 'dashboard/inbox "Quick Captures") "\n\n")
-        (dashboard/inbox :insert reuse-cache)
-        (insert "\n\n** " (dashboard--heading-link 'dashboard/rss-feeds "RSS") "\n\n")
-        (dashboard/rss-feeds :insert reuse-cache)
+        (insert "\n* 📩 Process Inbox" "\n\n")
+        
+        (let ((start (point-marker)))
+          (insert "\n\n** " (dashboard--heading-link 'oag-reviews-needed "👀 Whom am I blocking?")
+                  "\n\n---review their work---\n\n")
+          (oag-reviews-needed :insert reuse-cache
+                              :on-inserted (dashboard--hider reuse-cache start)))
 
-        (insert "\n\n* 📋 Urgent and unstarted\n\n** "
-                (dashboard--heading-link 'dashboard/priority-a-unscheduled "🔴 Priority A, unscheduled") "\n\n")
-        (insert "---Either schedule this stuff, or make peace with the fact that it's not high priority---\n\n")
-        (dashboard/priority-a-unscheduled :insert reuse-cache)
-        (insert "\n\n** " (dashboard--heading-link 'oag-reviews-needed "👀 Whom am I blocking?")
-                "\n\n---review their work---\n\n")
-        (oag-reviews-needed :insert reuse-cache)
-        (insert "\n\n** " (dashboard--heading-link 'oag-my-changes-needing-action "🔧 Feedback I need to address")
-                "\n\n---address it, then re-publish---\n\n")
-        (oag-my-changes-needing-action :insert reuse-cache)
+        (let ((start (point-marker)))
+          (insert "\n\n** " (dashboard--heading-link 'oag-my-changes-needing-action "🔧 Feedback I need to address")
+                  "\n\n---address it, then re-publish---\n\n")
+          (oag-my-changes-needing-action :insert reuse-cache
+                                         :on-inserted (dashboard--hider reuse-cache start)))
 
-        (insert "\n\n* 📆 Planning\n\n** "
-                (dashboard--heading-link 'dashboard/waiting "💢 I've been waiting on these for over a week, send reminder!") "\n\n")
-        (dashboard/waiting :insert reuse-cache)
-        (insert "\n\n** " (dashboard--heading-link 'oag-jira-urgent-not-started "🔥 Jira: Urgent Not Yet Started") "\n\n")
-        (insert "---pick one, scope it, push a draft---\n\n")
-        (oag-jira-urgent-not-started :insert reuse-cache)
-        (insert "\n\n** " (dashboard--heading-link 'oag-jira-active-no-gerrit "⚠️ Jira says active, Gerrit disagrees") "\n\n")
-        (insert (concat
-                 "These tickets are marked In Progress or In Review in Jira, yet\n"
-                 "none of my open Gerrit changes reference them.  For each row,\n"
-                 "pick exactly one:\n"
-                 "  - Push a draft change that cites the ticket in its footer, or\n"
-                 "  - Move the ticket back to To Do / Blocked --- the status is lying, or\n"
-                 "  - Reassign it, if someone else is actually carrying the work.\n"
-                 "Leaving a ticket here is a promise you are silently breaking.\n\n"))
-        (oag-jira-active-no-gerrit :insert reuse-cache)
-        (insert "\n\n** 📆 Overdue\n\n*** "
-                (dashboard--heading-link 'dashboard/deadline-overdue "Past deadline due-date") "\n\n")
-        (dashboard/deadline-overdue :insert reuse-cache)
-        (insert "\n\n*** " (dashboard--heading-link 'dashboard/overdue "Past scheduled start date") "\n\n")
-        (dashboard/overdue :insert reuse-cache)
-        (insert "\n\n** "
-                (dashboard--heading-link 'dashboard/open-loops "🤡 Please 𝒓𝒆𝒅𝒖𝒄𝒆 the number of (unscheduled) open loops") "\n\n")
-        (dashboard/open-loops :insert reuse-cache)
-        (insert "\n\n** " (dashboard--heading-link 'dashboard/work-in-progress "🚧 Gerrit: Work In Progress") "\n\n")
-        (dashboard/work-in-progress :insert reuse-cache))
+        (let ((start (point-marker)))
+          (insert "\n\n** "
+                  (dashboard--heading-link 'whatsapp/contacts "🫶 Social Connection") "\n\n")
+          (insert "---Reach out to someone today; relationships need tending. Press `d' to send a greeting.---\n\n")
+          (whatsapp/contacts :insert reuse-cache
+                             :on-inserted (dashboard--hider reuse-cache start)))
+
+        (let ((start (point-marker)))
+          (insert "\n\n** "
+                  (dashboard--heading-link 'actionable-mail/gmail-inbox "Personal Email") "\n\n")
+          (actionable-mail/gmail-inbox :insert reuse-cache
+                                       :on-inserted (dashboard--hider reuse-cache start)))
+        (let ((start (point-marker)))
+          (insert "\n\n** " (dashboard--heading-link 'dashboard/inbox "Quick Captures") "\n\n")
+          (dashboard/inbox :insert reuse-cache
+                           :on-inserted (dashboard--hider reuse-cache start)))
+        (let ((start (point-marker)))
+          (insert "\n\n** " (dashboard--heading-link 'dashboard/rss-feeds "RSS") "\n\n")
+          (dashboard/rss-feeds :insert reuse-cache
+                               :on-inserted (dashboard--hider reuse-cache start)))
+
+        (insert "\n\n* 📋 Urgent and unstarted")
+        (let ((start (point-marker)))
+          (insert "\n\n** "
+                  (dashboard--heading-link 'dashboard/priority-a-unscheduled "🔴 Priority A, unscheduled") "\n\n")
+          (insert "---Either schedule this stuff, or make peace with the fact that it's not high priority---\n\n")
+          (dashboard/priority-a-unscheduled :insert reuse-cache
+                                            :on-inserted (dashboard--hider reuse-cache start)))
+        (insert "\n\n* 📆 Planning")
+        (let ((start (point-marker)))
+          (insert "\n\n** "
+                  (dashboard--heading-link 'dashboard/waiting "💢 I've been waiting on these for over a week, send reminder!") "\n\n")
+          (dashboard/waiting :insert reuse-cache
+                             :on-inserted (dashboard--hider reuse-cache start)))
+        (let ((start (point-marker)))
+          (insert "\n\n** " (dashboard--heading-link 'oag-jira-urgent-not-started "🔥 Jira: Urgent Not Yet Started") "\n\n")
+          (insert "---pick one, scope it, push a draft---\n\n")
+          (oag-jira-urgent-not-started :insert reuse-cache
+                                       :on-inserted (dashboard--hider reuse-cache start)))
+        (let ((start (point-marker)))
+          (insert "\n\n** " (dashboard--heading-link 'oag-jira-active-no-gerrit "⚠️ Jira says active, Gerrit disagrees") "\n\n")
+          (insert (concat
+                   "These tickets are marked In Progress or In Review in Jira, yet\n"
+                   "none of my open Gerrit changes reference them.  For each row,\n"
+                   "pick exactly one:\n"
+                   "  - Push a draft change that cites the ticket in its footer, or\n"
+                   "  - Move the ticket back to To Do / Blocked --- the status is lying, or\n"
+                   "  - Reassign it, if someone else is actually carrying the work.\n"
+                   "Leaving a ticket here is a promise you are silently breaking.\n\n"))
+          (oag-jira-active-no-gerrit :insert reuse-cache
+                                     :on-inserted (dashboard--hider reuse-cache start)))
+        (insert "\n\n** 📆 Overdue")
+        (let ((start (point-marker)))
+          (insert "\n\n*** "
+                  (dashboard--heading-link 'dashboard/deadline-overdue "Past deadline due-date") "\n\n")
+          (dashboard/deadline-overdue :insert reuse-cache
+                                      :on-inserted (dashboard--hider reuse-cache start)))
+        (let ((start (point-marker)))
+          (insert "\n\n*** " (dashboard--heading-link 'dashboard/overdue "Past scheduled start date") "\n\n")
+          (dashboard/overdue :insert reuse-cache
+                             :on-inserted (dashboard--hider reuse-cache start)))
+        (let ((start (point-marker)))
+          (insert "\n\n** "
+                  (dashboard--heading-link 'dashboard/open-loops "🤡 Please 𝒓𝒆𝒅𝒖𝒄𝒆 the number of (unscheduled) open loops") "\n\n")
+          (dashboard/open-loops :insert reuse-cache
+                                :on-inserted (dashboard--hider reuse-cache start)))
+        (let ((start (point-marker)))
+          (insert "\n\n** " (dashboard--heading-link 'dashboard/work-in-progress "🚧 Gerrit: Work In Progress") "\n\n")
+          (dashboard/work-in-progress :insert reuse-cache
+                                      :on-inserted (dashboard--hider reuse-cache start))))
       (goto-char (point-min))))
   (pop-to-buffer "*Dashboard*"))
 

@@ -108,7 +108,7 @@ view-open time.
 Overridden by any explicit kwarg at the `actionable-query-defview' call site."
   `(:columns   aq-org-ql-columns
     :objects   (lambda () (aq--org-ql-fetch ',query-form (org-agenda-files)))
-    :org       (lambda (o) (plist-get o :marker))
+    :org-deserializer       (lambda (o) (plist-get o :marker))
     :actions   aq-org-ql-actions))
 
 ;; NB: the file is `org-ql.el' but the *feature* is `actionable-query-org-ql'

@@ -299,9 +299,9 @@ source order rather than collapsing in reverse."
     ;;     and have `aq--rerender-region' delete every view below).
     (with-current-buffer target-buf
       (goto-char pos)
-      (let ((inhibit-read-only t)
-            (begin (copy-marker pos))
-            end)
+      (let* ((inhibit-read-only t)
+             (begin (copy-marker pos))
+             end)
         (insert content)
         (setq end (copy-marker (point) nil))
         (when view-name
@@ -315,19 +315,24 @@ source order rather than collapsing in reverse."
                       :actions          actions
                       :help-echo-fn     help-echo-fn
                       :async-fn         async-fn
-                      :editable-setters (buffer-local-value 'aq--editable-setters src-buf))))
-            (put-text-property begin end 'aq--region-ctx ctx))))
-      (when help-echo-fn
-        (aq--install-host-help-echo))
-      ;; Standard region keys (g/=/e/t/h/…) ride a buffer-local override map
-      ;; --- fontification-proof, unlike the `keymap' text-property which
-      ;; org-mode strips on the first redisplay.
-      (when view-name
-        (aq--install-host-standard-keys))
-      (when (and view-name actions)
-        (aq--install-host-action-keys actions)))))
+                      :editable-setters (buffer-local-value 'aq--editable-setters src-buf)
+                      :org-serializer   (buffer-local-value 'aq--org-serializer src-buf))))
+            (put-text-property begin end 'aq--region-ctx ctx)))
+        (when help-echo-fn
+          (aq--install-host-help-echo))
+        ;; Standard region keys (g/=/e/t/h/…) ride a buffer-local override map
+        ;; --- fontification-proof, unlike the `keymap' text-property which
+        ;; org-mode strips on the first redisplay.
+        (when view-name
+          (aq--install-host-standard-keys))
+        (when (and view-name actions)
+          (aq--install-host-action-keys actions))
+        ;; Return the spliced region so callers (the `:on-inserted' hook) can
+        ;; act on the whole span --- e.g. delete an empty/all-scheduled section.
+        (cons begin end)))))
 
-(cl-defun aq--insert-view-async (view-buf &key help-echo-fn view-name actions async-fn)
+(cl-defun aq--insert-view-async (view-buf &key help-echo-fn view-name actions async-fn
+                                          on-inserted org-fn)
   "Reserve a slot in the current buffer; fill it when VIEW-BUF delivers.
 
 Composes the generic `point-async' primitive with actionable-query's
@@ -344,20 +349,29 @@ happens before the macro returns and the inserted vtable is
 already present when the caller's next `(insert ...)' lands.
 
 HELP-ECHO-FN, VIEW-NAME, ACTIONS, ASYNC-FN are forwarded to
-`aq--splice-view-into'."
-  (let ((here (point-async-reserve
+`aq--splice-view-into'.  ON-INSERTED, if non-nil, is called once after
+the splice with (OBJECTS BEGIN END ORG-FN) --- OBJECTS from the view
+buffer's `aq--all-objects', BEGIN/END the spliced region, ORG-FN the
+view's `:org' row→marker fn --- so a host can hide the section post-hoc."
+  (let ((host (current-buffer))
+        (here (point-async-reserve
                :label (format "fetching %s…" (or view-name "view")))))
     (with-current-buffer view-buf
       (letrec ((hook (lambda ()
                        ;; Resolve clears the placeholder and parks
                        ;; point at the slot in the host buffer.
                        (point-async-resolve here)
-                       (aq--splice-view-into
-                        view-buf (current-buffer) (point)
-                        :help-echo-fn help-echo-fn
-                        :view-name    view-name
-                        :actions      actions
-                        :async-fn     async-fn)
+                       (let ((region
+                              (aq--splice-view-into
+                               view-buf (current-buffer) (point)
+                               :help-echo-fn help-echo-fn
+                               :view-name    view-name
+                               :actions      actions
+                               :async-fn     async-fn))
+                             (objs (buffer-local-value 'aq--visible-objects view-buf)))
+                         (when (and on-inserted (functionp on-inserted) region)
+                           (with-current-buffer host
+                             (funcall on-inserted objs (car region) (cdr region) org-fn))))
                        (setq aq--post-deliver-hook
                              (delq hook aq--post-deliver-hook)))))
         (push hook aq--post-deliver-hook)))))

@@ -93,8 +93,11 @@
 ;;                              → cursor movement messages the return value.
 ;;
 ;; Org integration
-;;   `:org (lambda (row) …)'   → returning a live Org marker wires RET/TAB/I/o to that
+;;   `:org-deserializer (lambda (row) …)'
+;;                              → returning a live Org marker wires RET/TAB/I/o to that
 ;;                                heading; standard `org-agenda-mode-map' nav just works.
+;;                                The dual of `:org-serializer' (row → new tree).
+;;                                (`:org' is the old name, still accepted.)
 ;;
 ;; DRY for families of similar views
 ;;   `actionable-query-defview-def-keyword'
@@ -218,27 +221,34 @@ of major mode, so nothing of substance is lost."
 (defmacro aq--with-agenda-mode (&rest body)
   "Erase buffer, enter the view mode, restore AQ buffer-locals, run BODY.
 Switching major mode wipes buffer-local variables; this macro saves and
-restores the seven AQ locals that must survive the call.  (Name kept for
+restores the AQ locals that must survive the call.  (Name kept for
 call-site stability; the mode is now read-only `org-mode', see
 `aq--enter-view-mode'.)"
   (declare (indent 0))
   `(let ((--refresh-fn  aq--refresh-fn)
          (--start-time  aq--last-fetch-start-time)
          (--all         aq--all-objects)
+         (--visible     aq--visible-objects)
          (--total       aq--total-objects)
          (--post-hook   aq--post-deliver-hook)
          (--hearted-p   aq--show-hearted-only)
          (--editable    aq--editable-setters)
+         ;; Must survive the mode switch too, else async views lose their
+         ;; `:org-serializer' on deliver --- RET/C-c C-s then mint a raw-text
+         ;; heading (and the splice, reading it from this buffer, mirrors nil).
+         (--serializer  aq--org-serializer)
          (inhibit-read-only t))
      (erase-buffer)
      (aq--enter-view-mode)
      (setq aq--refresh-fn            --refresh-fn
            aq--last-fetch-start-time --start-time
            aq--all-objects           --all
+           aq--visible-objects       --visible
            aq--total-objects         --total
            aq--post-deliver-hook     --post-hook
            aq--show-hearted-only     --hearted-p
-           aq--editable-setters      --editable)
+           aq--editable-setters      --editable
+           aq--org-serializer        --serializer)
      ,@body))
 
 (defun aq--make-deliver (buf view-name actions snooze
@@ -278,7 +288,9 @@ single-row widgets (clock, weather) where the count is just noise."
                (groups-alist (when grouped (cl-loop for (k v) on raw-objects by #'cddr collect (cons k v)))))
           (if grouped
               (setq aq--all-objects   (apply #'append (mapcar #'cdr groups-alist))
-                    aq--total-objects (length aq--all-objects))
+                    aq--total-objects (length aq--all-objects)
+                    ;; Grouped views don't dismissal-filter; visible == all.
+                    aq--visible-objects aq--all-objects)
             (setq aq--all-objects   raw-objects
                   aq--total-objects (length raw-objects)))
           (if grouped
@@ -309,6 +321,7 @@ single-row widgets (clock, weather) where the count is just noise."
                         raw-objects))
                      aq--active-filters
                      coerced-cols)))
+              (setq aq--visible-objects objects)   ; the rendered (post-filter) set
               (if table
                   ;; Re-render into existing vtable (e.g. `g' refresh).
                   (progn
@@ -572,7 +585,9 @@ except these, which are intercepted:
   `:hearting'      — t to enable h/H heart-toggle and hearted-only filter.
                      Hearts are persisted via savehist.  On open, defaults to
                      hearted-only when any hearts exist for this view.
-  `:org'           — (lambda (it) …) returning an org marker or nil.
+  `:org-deserializer' — (lambda (it) …) returning the existing org marker to
+                     associate row IT with, or nil.  Dual of `:org-serializer'
+                     (which mints a *new* tree).  Alias: `:org' (old name).
                      On each cursor move, the lambda is called with the current
                      row object; when it returns a live marker, `org-marker' and
                      `org-hd-marker' are set on that line — enabling standard
@@ -599,9 +614,10 @@ overrides anything the preset would have defaulted."
                           ((stringp name-or-sym)      vtable-kwargs)
                           (t                          (cons name-or-sym vtable-kwargs))))
          (actionable-query-keys        '(:help-echo :prose :prose-bottom :actions :objects
-                                         :snooze-period :auto-refresh :group-by :hearting :org
+                                         :snooze-period :auto-refresh :group-by :hearting
+                                         :org-deserializer :org
                                          :org-serializer :no-footer
-                                         :async-notifier :insert))
+                                         :async-notifier :insert :on-inserted))
          (vtable-keys       '(:columns :objects-function :getter :formatter :displayer
                                        :use-header-line :face :actions :keymap
                                        :separator-width :divider :divider-width
@@ -627,7 +643,11 @@ overrides anything the preset would have defaulted."
          (refresh-form      (plist-get vtable-kwargs :auto-refresh))
          (group-by-form     (plist-get vtable-kwargs :group-by))
          (hearting-form     (plist-get vtable-kwargs :hearting))
-         (org-form          (plist-get vtable-kwargs :org))
+         ;; `:org-deserializer' is the dual of `:org-serializer' --- (row) → the
+         ;; existing Org marker to associate the row with.  `:org' is the old name,
+         ;; still accepted.
+         (org-form          (or (plist-get vtable-kwargs :org-deserializer)
+                                (plist-get vtable-kwargs :org)))
          (serializer-form   (plist-get vtable-kwargs :org-serializer))
          (no-footer-form    (plist-get vtable-kwargs :no-footer))
          (notifier-form     (plist-get vtable-kwargs :async-notifier))
@@ -658,11 +678,18 @@ overrides anything the preset would have defaulted."
             (lambda (&rest call-kwargs)
               (interactive)
               (let* ((insert-mode    (plist-get call-kwargs :insert))
+                     ;; Call-time only: fired once after the view's content is
+                     ;; spliced/rendered, with (OBJECTS BEGIN END ORG-FN) --- lets a
+                     ;; composite host (e.g. the dashboard) hide an empty or
+                     ;; all-scheduled section post-hoc.
+                     (on-inserted-fn (plist-get call-kwargs :on-inserted))
                      (help-echo-fn   (or (plist-get call-kwargs :help-echo)      ,help-echo-form))
                      (actions-spec   (or (plist-get call-kwargs :actions)        ,actions-form))
                      (objects-spec   (or (plist-get call-kwargs :objects)        ,objects-form))
                      (group-by-fn    (or (plist-get call-kwargs :group-by)       ,group-by-form))
-                     (org-fn         (or (plist-get call-kwargs :org)            ,(when org-form `(lambda (it) ,org-form))))
+                     (org-fn         (or (plist-get call-kwargs :org-deserializer)
+                                         (plist-get call-kwargs :org)
+                                         ,(when org-form `(lambda (it) ,org-form))))
                      (serializer-fn   (or (plist-get call-kwargs :org-serializer)
                                           ,serializer-form))
                      (notifier-fn    (or (plist-get call-kwargs :async-notifier) ,(when notifier-form `(lambda () ,notifier-form))))
@@ -697,7 +724,10 @@ overrides anything the preset would have defaulted."
                  (setq aq--marked-rows   nil
                        aq--active-filters nil
                        aq--all-objects    nil
-                       aq--total-objects  nil)
+                       aq--total-objects  nil
+                       ;; Invalidate the content-join marker cache each render, so
+                       ;; a `g'-refresh re-resolves keys against the current notes.
+                       aq--org-key-marker-cache nil)
                  (aq--clear-mark-overlays)
                  (let ((inhibit-read-only t))
                    (erase-buffer)
@@ -720,6 +750,16 @@ overrides anything the preset would have defaulted."
                      nil)
                     (t
                      (let ((objs (if (functionp obj-spec) (funcall obj-spec) obj-spec)))
+                       ;; Record the sync row set (the async path sets this in
+                       ;; `aq--make-deliver'); the `:on-inserted' hook and the
+                       ;; `?'/bulk/filter machinery read it as the source of truth.
+                       (setq aq--all-objects   (if (aq--grouped-p objs)
+                                                   (cl-loop for (_k v) on objs by #'cddr append v)
+                                                 objs)
+                             aq--total-objects (length aq--all-objects)
+                             ;; Sync views render `objs' directly (no snooze filter),
+                             ;; so the visible set is the full set.
+                             aq--visible-objects aq--all-objects)
                        (if (aq--grouped-p objs)
                            ;; A sync `:objects' may itself return a grouped plist
                            ;; ("Title" objs "Title2" objs2 …) --- lay it out as
@@ -803,7 +843,9 @@ overrides anything the preset would have defaulted."
                           :help-echo-fn help-echo-fn
                           :view-name    ,name
                           :actions      actions
-                          :async-fn     async-fn)))
+                          :async-fn     async-fn
+                          :on-inserted  on-inserted-fn
+                          :org-fn       org-fn)))
                      (when-let ((cached (gethash ,name aq--object-cache)))
                        (funcall deliver cached))
                      (let* ((threshold  actionable-query-auto-fetch-slow-threshold)
@@ -872,11 +914,18 @@ overrides anything the preset would have defaulted."
                    ;; path here.  Without an async slot we're in the
                    ;; non-async / cached-content branch — splice now.
                    (unless async-splice-p
-                     (aq--splice-view-into buf insert-target insert-pos
-                                           :help-echo-fn help-echo-fn
-                                           :view-name    ,name
-                                           :actions      actions
-                                           :async-fn     async-fn))))))))
+                     (let ((region (aq--splice-view-into buf insert-target insert-pos
+                                                         :help-echo-fn help-echo-fn
+                                                         :view-name    ,name
+                                                         :actions      actions
+                                                         :async-fn     async-fn)))
+                       ;; Sync-splice path: content is fully in the host now, so
+                       ;; fire the caller's `:on-inserted' with the rows + region.
+                       (when (and on-inserted-fn (functionp on-inserted-fn) region)
+                         (with-current-buffer insert-target
+                           (funcall on-inserted-fn
+                                    (buffer-local-value 'aq--visible-objects buf)
+                                    (car region) (cdr region) org-fn)))))))))))
           ,@(when name
               ;; Register the view in `org-ql-views' so `M-x' completion finds
               ;; it and so `(name)' lookups across the codebase work.
