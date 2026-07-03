@@ -88,28 +88,35 @@ transient is asynchronous — the closures fire after this fn has
 returned."
   (interactive)
   (if-let ((ctx (aq--ctx-at-point)))
-      (progn
+      (let* ((row-actions (aq-region-ctx-actions ctx))
+             (claimed     (mapcar #'car row-actions))   ; keys the view redefined
+             ;; Reuse the shared default groups (`aq--install-popup' uses the same
+             ;; source), so a spliced row advertises the *same* command set as a
+             ;; dedicated buffer --- notably the "Org Agenda Commands" group with
+             ;; RET "Jump to Org tree".  That group is shown only when this region's
+             ;; view wired up Org integration (`:org-upsert' → a marker).
+             (org-view-p  (aq-region-ctx-org-upsert ctx))
+             (groups
+              (let (gs)
+                (dolist (grp aq--popup-default-groups (nreverse gs))
+                  (let ((title (car grp)) (entries (cdr grp)))
+                    ;; Skip the Org-agenda group unless this view wired up Org
+                    ;; integration (`:org-upsert').
+                    (unless (and (equal title "Org Agenda Commands") (not org-view-p))
+                      (let ((kept (cl-remove-if (lambda (e) (member (car e) claimed)) entries)))
+                        (when kept (push (vconcat (list title) kept) gs)))))))))
         (setq aq--current-row (vtable-current-object))
         (eval `(transient-define-prefix aq--region-transient-popup ()
                  "Actionable-query row actions"
                  ["Row Actions"
                   :class transient-column
-                  ,@(cl-loop for (key desc fn) in (aq-region-ctx-actions ctx)
+                  ,@(cl-loop for (key desc fn) in row-actions
                              collect (let ((f fn))
                                        `(,key ,desc
                                               (lambda ()
                                                 (interactive)
                                                 (funcall ',f aq--current-row)))))]
-                 [["Structural"
-                   ("m"  "Mark for bulk action"  actionable-query-mark-row)
-                   ("U"  "Unmark all"            actionable-query-unmark-all)
-                   ("B"  "Bulk action"           actionable-query-bulk-action-interactive)
-                   ("M-<up>"   "Move row up"     ,(lambda () (interactive) (aq--move-row -1)))
-                   ("M-<down>" "Move row down"   ,(lambda () (interactive) (aq--move-row  1)))]
-                  ["Vtable"
-                   ("g"  "Refresh table"         aq-region-refresh)
-                   ("="  "Filter column"         aq-region-filter)
-                   ("S"  "Toggle sort"           vtable-sort-by-current-column)]]
+                 ,(apply #'vector groups)
                  ["" ("C-g" "Dismiss" transient-quit-one)]) t)
         (call-interactively 'aq--region-transient-popup))
     (user-error "Not inside a spliced view")))
@@ -316,7 +323,7 @@ source order rather than collapsing in reverse."
                       :help-echo-fn     help-echo-fn
                       :async-fn         async-fn
                       :editable-setters (buffer-local-value 'aq--editable-setters src-buf)
-                      :org-serializer   (buffer-local-value 'aq--org-serializer src-buf))))
+                      :org-upsert       (buffer-local-value 'aq--org-upsert src-buf))))
             (put-text-property begin end 'aq--region-ctx ctx)))
         (when help-echo-fn
           (aq--install-host-help-echo))

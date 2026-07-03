@@ -93,11 +93,12 @@
 ;;                              → cursor movement messages the return value.
 ;;
 ;; Org integration
-;;   `:org-deserializer (lambda (row) …)'
-;;                              → returning a live Org marker wires RET/TAB/I/o to that
-;;                                heading; standard `org-agenda-mode-map' nav just works.
-;;                                The dual of `:org-serializer' (row → new tree).
-;;                                (`:org' is the old name, still accepted.)
+;;   `:org-upsert (lambda (row) …)'
+;;                              → returns the Org marker to associate ROW with,
+;;                                finding its existing tree or minting one (see
+;;                                `actionable-query-upsert-org-tree').  Wires
+;;                                RET/TAB/I/o to that heading; standard
+;;                                `org-agenda-mode-map' nav just works.
 ;;
 ;; DRY for families of similar views
 ;;   `actionable-query-defview-def-keyword'
@@ -234,9 +235,9 @@ call-site stability; the mode is now read-only `org-mode', see
          (--hearted-p   aq--show-hearted-only)
          (--editable    aq--editable-setters)
          ;; Must survive the mode switch too, else async views lose their
-         ;; `:org-serializer' on deliver --- RET/C-c C-s then mint a raw-text
-         ;; heading (and the splice, reading it from this buffer, mirrors nil).
-         (--serializer  aq--org-serializer)
+         ;; `:org-upsert' fn on deliver --- RET/C-c C-s then can't find-or-mint
+         ;; the heading (and the splice, reading it from this buffer, mirrors nil).
+         (--upsert      aq--org-upsert)
          (inhibit-read-only t))
      (erase-buffer)
      (aq--enter-view-mode)
@@ -248,7 +249,7 @@ call-site stability; the mode is now read-only `org-mode', see
            aq--post-deliver-hook     --post-hook
            aq--show-hearted-only     --hearted-p
            aq--editable-setters      --editable
-           aq--org-serializer        --serializer)
+           aq--org-upsert            --upsert)
      ,@body))
 
 (defun aq--make-deliver (buf view-name actions snooze
@@ -377,21 +378,12 @@ single-row widgets (clock, weather) where the count is just noise."
   "Non-nil when the user pressed Q to abort the current in-flight fetch.
 The deliver callback checks this flag and no-ops if set; reset on next `g'.")
 
-(defvar-local aq--org-serializer nil
-  "View-supplied (lambda (row-object) -> SPEC) describing a created Org tree.
-Set from the `:org-serializer' defview keyword.  When an agenda command
-mints a heading for a markerless row, `aq-agenda--ensure-marker' calls this
-to decide the new tree's title, properties, and body.  SPEC is either:
-
-  - a STRING            → that becomes the headline; no properties, no body; or
-  - (TITLE :K V … BODY) → TITLE is the headline string; each :K V pair
-                          becomes a property; a trailing non-keyword STRING
-                          (optional) becomes the body text.
-
-So a calendar view can return e.g.
-  (\"Standup\" :ZOOM \"https://…\" :SCHEDULED \"<2026-…>\" \"agenda notes\").
-Parsed by `aq--parse-org-serializer-spec'.  Nil means fall back to the
-generic title heuristics in `aq-agenda--row-title'.")
+(defvar-local aq--org-upsert nil
+  "View-supplied (lambda (row-object) -> marker) for the `:org-upsert' keyword.
+Given a row, it returns the live Org marker to associate the row with, finding
+an existing tree or minting one (typically via `actionable-query-upsert-org-tree').
+Consulted per cursor move (nav) and by the RET / C-c C-s heading-mint path
+(`aq-agenda--marker-or-create').  Nil for views with no Org integration.")
 
 (defun aq-abort-fetch ()
   "Abort the in-flight async fetch for this view.
@@ -585,14 +577,15 @@ except these, which are intercepted:
   `:hearting'      — t to enable h/H heart-toggle and hearted-only filter.
                      Hearts are persisted via savehist.  On open, defaults to
                      hearted-only when any hearts exist for this view.
-  `:org-deserializer' — (lambda (it) …) returning the existing org marker to
-                     associate row IT with, or nil.  Dual of `:org-serializer'
-                     (which mints a *new* tree).  Alias: `:org' (old name).
-                     On each cursor move, the lambda is called with the current
-                     row object; when it returns a live marker, `org-marker' and
-                     `org-hd-marker' are set on that line — enabling standard
-                     `org-agenda-mode-map' navigation (RET, TAB, I, o) to jump
-                     to the linked Org heading.
+  `:org-upsert'    — (lambda (it) …) returning the Org marker to associate row
+                     IT with, or nil.  One keyword for the whole row↔org-tree
+                     round-trip: the lambda finds IT's existing tree or mints one
+                     (typically via `actionable-query-upsert-org-tree', which
+                     find-or-creates and stamps an `:AQ-KEY:' so it re-finds next
+                     time).  On each cursor move the lambda is called with the
+                     current row; a live marker sets `org-marker'/`org-hd-marker'
+                     on that line — enabling standard `org-agenda-mode-map'
+                     navigation (RET, TAB, I, o) to jump to the heading.
 
 Additional keywords registered via `actionable-query-defview-def-keyword' expand
 to bundled default kwargs.  An explicit keyword at the call site
@@ -615,8 +608,7 @@ overrides anything the preset would have defaulted."
                           (t                          (cons name-or-sym vtable-kwargs))))
          (actionable-query-keys        '(:help-echo :prose :prose-bottom :actions :objects
                                          :snooze-period :auto-refresh :group-by :hearting
-                                         :org-deserializer :org
-                                         :org-serializer :no-footer
+                                         :org-upsert :no-footer
                                          :async-notifier :insert :on-inserted))
          (vtable-keys       '(:columns :objects-function :getter :formatter :displayer
                                        :use-header-line :face :actions :keymap
@@ -643,12 +635,11 @@ overrides anything the preset would have defaulted."
          (refresh-form      (plist-get vtable-kwargs :auto-refresh))
          (group-by-form     (plist-get vtable-kwargs :group-by))
          (hearting-form     (plist-get vtable-kwargs :hearting))
-         ;; `:org-deserializer' is the dual of `:org-serializer' --- (row) → the
-         ;; existing Org marker to associate the row with.  `:org' is the old name,
-         ;; still accepted.
-         (org-form          (or (plist-get vtable-kwargs :org-deserializer)
-                                (plist-get vtable-kwargs :org)))
-         (serializer-form   (plist-get vtable-kwargs :org-serializer))
+         ;; `:org-upsert' --- (row) → the Org marker to associate the row with,
+         ;; finding an existing tree or minting one (see
+         ;; `actionable-query-upsert-org-tree').  One keyword for the whole
+         ;; row↔org-tree round-trip.
+         (org-form          (plist-get vtable-kwargs :org-upsert))
          (no-footer-form    (plist-get vtable-kwargs :no-footer))
          (notifier-form     (plist-get vtable-kwargs :async-notifier))
          (insert-form       (plist-get vtable-kwargs :insert))
@@ -687,11 +678,13 @@ overrides anything the preset would have defaulted."
                      (actions-spec   (or (plist-get call-kwargs :actions)        ,actions-form))
                      (objects-spec   (or (plist-get call-kwargs :objects)        ,objects-form))
                      (group-by-fn    (or (plist-get call-kwargs :group-by)       ,group-by-form))
-                     (org-fn         (or (plist-get call-kwargs :org-deserializer)
-                                         (plist-get call-kwargs :org)
-                                         ,(when org-form `(lambda (it) ,org-form))))
-                     (serializer-fn   (or (plist-get call-kwargs :org-serializer)
-                                          ,serializer-form))
+                     ;; `:org-upsert' is a complete `(lambda (row) → marker|key)'
+                     ;; expression --- evaluate it directly.  (Do NOT wrap in
+                     ;; `(lambda (it) …)': the value is already the function, and
+                     ;; a builder like `org-agenda-gerrit--org-upsert' *returns*
+                     ;; the lambda, so wrapping would yield a fn that returns a fn.)
+                     (org-fn         (or (plist-get call-kwargs :org-upsert)
+                                         ,org-form))
                      (notifier-fn    (or (plist-get call-kwargs :async-notifier) ,(when notifier-form `(lambda () ,notifier-form))))
                      (insert-target (and insert-mode (current-buffer)))
                      ;; Use a marker so subsequent inserts (later sections of a
@@ -789,7 +782,7 @@ overrides anything the preset would have defaulted."
                    ,@(when prose-bottom-form
                        `((goto-char (point-max)) (insert "\n\n") ,prose-bottom-form)))
                  (setq-local org-ql-view-title ,name)
-                 (setq-local aq--org-serializer serializer-fn)
+                 (setq-local aq--org-upsert org-fn)
                  (aq--install-standard-hooks ,name actions help-echo-fn org-fn)
                  (aq--goto-first-row)
                  (if async-fn

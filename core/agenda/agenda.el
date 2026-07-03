@@ -53,10 +53,8 @@ the org-marker post-command hook, but the object is always on the line."
                   ((markerp m)))
         m)))
 
-(defvar aq--org-serializer)             ; from actionable-query.el (buffer-local)
-
-(defun aq--parse-org-serializer-spec (spec)
-  "Parse an `:org-serializer' SPEC into (TITLE PROPS BODY).
+(defun aq--parse-org-title-spec (spec)
+  "Parse an `:org-upsert' title SPEC into (TITLE PROPS BODY).
 SPEC is either a STRING (just the title) or a list
 \(TITLE :K V … BODY) where the :K V pairs become PROPS (an alist of
 \(\"K\" . \"V\") with stringified keys/values) and an optional trailing
@@ -77,106 +75,156 @@ BODY may be nil.  TITLE is nil when SPEC is malformed."
       (list (and (stringp title) title) (nreverse props) body)))
    (t (list nil nil nil))))
 
-(declare-function aq--ctx-at-point "state-region-ctx")
-(declare-function aq-region-ctx-org-serializer "state-region-ctx")
+(defun aq--find-org-tree-by-key (key &optional scope-marker)
+  "Return a marker on the first heading matching KEY, or nil.
+Matches a heading whose `:AQ-KEY:' property equals KEY (the durable join,
+survives title edits) or, failing that, whose text contains KEY (the
+content-join --- e.g. a Jira ID written into the heading).
 
-(defun aq--row-serializer-spec (obj)
-  "Run the view's `:org-serializer' on row OBJ, returning its raw SPEC or nil.
-In a dedicated view buffer the serializer is the buffer-local
-`aq--org-serializer'; in a spliced host buffer that buffer-local is
-absent, so we fall back to the one carried on the region's
-`aq-region-ctx' --- keeping RET / C-c C-s / I heading-minting identical
-whether the view is standalone or spliced into the dashboard."
-  ;; OBJ is a row object --- a plist (cons) for org-ql views, or a
-  ;; `cl-defstruct' record (e.g. `org-agenda-gerrit-item') for gerrit views.
-  ;; Accept both; only a bare nil/atom row has nothing to serialize.
-  (when (or (consp obj) (recordp obj))
-    (when-let ((ser (or (and (bound-and-true-p aq--org-serializer) aq--org-serializer)
-                        (when-let ((ctx (and (fboundp 'aq--ctx-at-point)
-                                             (aq--ctx-at-point))))
-                          (aq-region-ctx-org-serializer ctx)))))
-      (funcall ser obj))))
+Without SCOPE-MARKER the whole `org-default-notes-file' is searched.  With
+SCOPE-MARKER (a live marker on a parent heading) the search is restricted to
+that heading's subtree --- so a child key like `FWD-1@2026-07-03' is found only
+under its own parent, never a namesake elsewhere."
+  (when (and (stringp key) (not (string-empty-p key)))
+    (if scope-marker
+        (when (and (markerp scope-marker) (marker-buffer scope-marker))
+          (org-with-point-at scope-marker
+            (org-back-to-heading t)
+            (catch 'found
+              ;; `org-map-entries' with MATCH nil and SCOPE `tree' walks the
+              ;; subtree at point (the parent heading + its descendants).
+              (org-map-entries
+               (lambda () (when (equal (org-entry-get (point) "AQ-KEY") key)
+                            (throw 'found (point-marker))))
+               nil 'tree)
+              nil)))
+      (when (and org-default-notes-file (file-exists-p org-default-notes-file))
+        (with-current-buffer (find-file-noselect org-default-notes-file)
+          (save-excursion
+            (goto-char (point-min))
+            (catch 'found
+              ;; Pass 1 — durable `:AQ-KEY:' property match.
+              (org-map-entries
+               (lambda () (when (equal (org-entry-get (point) "AQ-KEY") key)
+                            (throw 'found (point-marker)))))
+              ;; Pass 2 — the KEY appears literally in a heading's text.
+              (goto-char (point-min))
+              (when (re-search-forward (concat "^\\*+ .*" (regexp-quote key)) nil t)
+                (org-back-to-heading t)
+                (throw 'found (point-marker)))
+              nil)))))))
+
+(defun actionable-query--create-org-tree (title props body &optional key parent-marker)
+  "Create a `TODO TITLE' heading and return its marker.
+PROPS is an alist of (\"NAME\" . \"VALUE\") set via `org-entry-put'; BODY, when a
+non-blank string, is inserted under the heading.  KEY, when given, is stamped as
+the `:AQ-KEY:' property so a later `aq--find-org-tree-by-key' re-finds this tree
+even if TITLE is edited.  A `CREATED' property is always stamped.
+
+Without PARENT-MARKER the heading is a top-level `* ' at the end of
+`org-default-notes-file'.  With PARENT-MARKER (a live marker on a parent
+heading) it is created as the last child of that parent --- one level deeper,
+inserted after the parent's existing subtree."
+  (let* ((parent-buf (and (markerp parent-marker) (marker-buffer parent-marker)))
+         (buf (or parent-buf (find-file-noselect org-default-notes-file))))
+    (with-current-buffer buf
+      (save-excursion
+        (if parent-marker
+            ;; Child: go to end of the parent's subtree, open a heading one
+            ;; level deeper.  `org-insert-heading' + `org-demote' keeps the
+            ;; star count correct relative to the parent.
+            (let (child-stars)
+              (goto-char parent-marker)
+              (org-back-to-heading t)
+              (setq child-stars (make-string (1+ (org-current-level)) ?*))
+              (org-end-of-subtree t t)
+              (unless (bolp) (insert "\n"))
+              (insert (format "%s TODO %s\n" child-stars title)))
+          (goto-char (point-max))
+          (unless (bolp) (insert "\n"))
+          (insert (format "* TODO %s\n" title)))
+        (when (and (stringp body) (not (string-empty-p body)))
+          (insert "  " (string-trim body) "\n"))
+        (org-back-to-heading t)
+        (dolist (kv props) (org-entry-put (point) (car kv) (cdr kv)))
+        (when (and (stringp key) (not (string-empty-p key)))
+          (org-entry-put (point) "AQ-KEY" key))
+        (org-entry-put (point) "CREATED" (format-time-string "[%Y-%m-%d %a %H:%M]"))
+        (point-marker)))))
+
+(cl-defun actionable-query-upsert-org-tree (&key key title-spec)
+  "Return a live Org marker for a row, creating its tree if none exists (upsert).
+This is the workhorse a view's `:org-upsert' lambda calls: find-or-create in
+one shot.  KEY is the durable join key (e.g. a Jira ID).  First
+`aq--find-org-tree-by-key' looks for an existing heading (by `:AQ-KEY:' property,
+else by KEY appearing in the heading text); if found, that marker is returned and
+nothing is written.  Otherwise a heading is minted from TITLE-SPEC (a STRING or
+\(TITLE :K V … BODY), see `aq--parse-org-title-spec') with KEY stamped as
+`:AQ-KEY:' so the next call re-finds it.  Either way a marker comes back."
+  (or (aq--find-org-tree-by-key key)
+      (pcase-let ((`(,title ,props ,body) (aq--parse-org-title-spec title-spec)))
+        (actionable-query--create-org-tree (or title key "Untitled") props body key))))
+
+(cl-defun actionable-query-upsert-org-child (&key parent-key parent-title-spec
+                                                  child-key child-title-spec)
+  "Upsert a nested CHILD tree under a PARENT tree; return the CHILD marker.
+Two-level find-or-create: first `actionable-query-upsert-org-tree' finds/mints
+the parent (by PARENT-KEY / PARENT-TITLE-SPEC, top level).  Then, scoped to the
+parent's subtree, find a child whose `:AQ-KEY:' is CHILD-KEY; if none, create it
+as a child of the parent from CHILD-TITLE-SPEC, stamped with CHILD-KEY.
+
+The intended use (Gerrit/Jira): PARENT-KEY is the bare Jira ID (one tree per
+ticket) and CHILD-KEY is `JIRA@YYYY-MM-DD' (one child per ticket per day) --- so
+re-visiting the same ticket the same day re-finds the same dated child rather
+than duplicating it."
+  (let ((parent (actionable-query-upsert-org-tree
+                 :key parent-key :title-spec parent-title-spec)))
+    (or (aq--find-org-tree-by-key child-key parent)
+        (pcase-let ((`(,title ,props ,body) (aq--parse-org-title-spec child-title-spec)))
+          (actionable-query--create-org-tree
+           (or title child-key "Untitled") props body child-key parent)))))
 
 (defun aq-row-scheduled-on-or-after-today-p (obj org-fn)
   "Non-nil when OBJ's Org heading (resolved via ORG-FN) is SCHEDULED today or later.
-ORG-FN is the view's `:org-deserializer' (marker- or key-string-returning); we
-resolve it through `aq-org-marker-of' so the content-join case works too.  A row
-that is unscheduled, or scheduled in the past (overdue), returns nil --- those
-still warrant attention, so a section holding them should stay visible."
+ORG-FN is the view's `:org-upsert' fn (returns a marker or a content-join key);
+we resolve it through `aq-org-marker-of'.  A row that is unscheduled, or scheduled
+in the past (overdue), returns nil --- those still warrant attention, so a section
+holding them should stay visible."
   (when-let* ((m  (aq-org-marker-of obj org-fn))
               ((markerp m))
               ((marker-buffer m))
               (ts (org-with-point-at m (org-get-scheduled-time (point)))))
     (>= (time-to-days ts) (org-today))))
 
-(defun aq-agenda--ensure-marker (obj title-string)
-  "Return a live Org marker for OBJ, creating a heading if none exists.
-TITLE-STRING is the fallback headline.  When the view supplied
-`:org-serializer', its SPEC for OBJ drives the new tree's title,
-properties, and body (see `aq--parse-org-serializer-spec') --- a calendar
-view uses this to serialize the SCHEDULED time, Zoom link, attendees, etc.
-The new heading lands at the end of `org-default-notes-file'."
-  (let* ((table (actionable-query-resolve-org-markers
-                 (list obj) (lambda (_) title-string)))
-         (marker (gethash obj table))
-         ;; Resolve the spec *here*, in the view buffer where the serializer
-         ;; is bound (we switch buffers to create the heading below).
-         (parsed (aq--parse-org-serializer-spec (aq--row-serializer-spec obj)))
-         (title  (or (nth 0 parsed) title-string))
-         (props  (nth 1 parsed))
-         (body   (nth 2 parsed)))
-    (or (and (markerp marker) (marker-buffer marker) marker)
-        (with-current-buffer (find-file-noselect org-default-notes-file)
-          (save-excursion
-            (goto-char (point-max))
-            (unless (bolp) (insert "\n"))
-            ;; Headline first; a SCHEDULED/DEADLINE planning line (if the view
-            ;; passes one as a property named SCHEDULED) is handled by Org's
-            ;; own machinery via `org-entry-put', which places it correctly.
-            (insert (format "* TODO %s\n" title))
-            (when (and (stringp body) (not (string-empty-p body)))
-              (insert "  " (string-trim body) "\n"))
-            (org-back-to-heading t)
-            (dolist (kv props)
-              (org-entry-put (point) (car kv) (cdr kv)))
-            (org-entry-put (point) "CREATED"
-                           (format-time-string "[%Y-%m-%d %a %H:%M]"))
-            (point-marker))))))
+(declare-function aq--ctx-at-point "state-region-ctx")
+(declare-function aq-region-ctx-org-upsert "state-region-ctx")
+(defvar aq--org-upsert)                 ; buffer-local, from actionable-query.el
 
-(defun aq-agenda--row-title (obj)
-  "Best-effort heading text for the current row.
-Resolution order:
-  1. the TITLE from the view's `:org-serializer' SPEC, if any;
-  2. OBJ's `:heading'/`:title'/`:subject' plist keys;
-  3. the visible text of the row at point.
-So a view can override how a markerless row is titled, and even a row with
-no titley key still yields something to name a created heading after."
-  (or (let ((title (nth 0 (aq--parse-org-serializer-spec
-                           (aq--row-serializer-spec obj)))))
-        (and (stringp title) (not (string-empty-p title)) title))
-      (and (consp obj)
-           (or (plist-get obj :heading)
-               (plist-get obj :title)
-               (plist-get obj :subject)))
-      (let ((line (string-trim
-                   (buffer-substring-no-properties (line-beginning-position)
-                                                   (line-end-position)))))
-        (unless (string-empty-p line) line))))
+(defun aq--row-upsert-fn ()
+  "The active view's `:org-upsert' fn: the buffer-local `aq--org-upsert' in a
+dedicated view buffer, else the one on the region's `aq-region-ctx' in a spliced
+host buffer --- so RET / C-c C-s / I mint-or-find identically either way."
+  (or (and (bound-and-true-p aq--org-upsert) aq--org-upsert)
+      (when-let ((ctx (and (fboundp 'aq--ctx-at-point) (aq--ctx-at-point))))
+        (aq-region-ctx-org-upsert ctx))))
 
 (defun aq-agenda--marker-or-create ()
   "Return the Org marker for the current row, creating a tree if none exists.
 A main point of actionable-query is that org-agenda-style keys work on any
-row --- so a markerless row (e.g. a gcal/Gerrit item with no Org heading)
-gets a fresh `* TODO <title>' heading minted at the end of
-`org-default-notes-file', and that marker is stitched back onto the row's
-object so later commands act on the same heading."
+row --- so a markerless row (e.g. a gcal/Gerrit item with no Org heading) is
+resolved through the view's `:org-upsert' fn, which finds its existing tree or
+mints a fresh one (see `actionable-query-upsert-org-tree').  The resulting
+marker is stitched back onto the row so later commands act on the same heading."
   (or (aq-agenda--current-marker)
-      (let* ((obj   (get-text-property (line-beginning-position) 'vtable-object))
-             (title (or (aq-agenda--row-title obj)
-                        (user-error "No Org entry, and no title to create one from")))
-             (marker (aq-agenda--ensure-marker obj title)))
-        ;; Stitch the new marker onto the row object so subsequent commands /
-        ;; the org-marker line property find it without re-creating.
+      (let* ((obj    (get-text-property (line-beginning-position) 'vtable-object))
+             (upsert (aq--row-upsert-fn))
+             ;; `:org-upsert' may return a marker (it did find-or-create itself)
+             ;; or a content-join key string; `aq-org-marker-of' normalises both.
+             (marker (and upsert obj (aq-org-marker-of obj upsert))))
+        (unless (and (markerp marker) (marker-buffer marker))
+          (user-error "No Org entry for this row (and its `:org-upsert' produced none)"))
+        ;; Stitch the marker onto the row object so subsequent commands / the
+        ;; org-marker line property find it without re-resolving.
         (when (consp obj)
           (plist-put obj :marker marker)
           (let ((inhibit-read-only t))

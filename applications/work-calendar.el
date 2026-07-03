@@ -689,7 +689,7 @@ clash that already elapsed isn't worth a red alarm."
   (propertize str 'face (dashboard--row-face o)))
 
 (defun dashboard--calendar-serializer (o)
-  "Serialize calendar event O into an `:org-serializer' SPEC.
+  "Serialize calendar event O into a title-spec for `:org-upsert''s `:title-spec'.
 Returns (TITLE :SCHEDULED <today @ start> :ZOOM … :LOCATION … :ATTENDEES …),
 dropping any field the event lacks --- so an agenda key minting a tree from
 a gcal row gets it scheduled for the viewing date at the known start time,
@@ -740,12 +740,16 @@ SCHEDULED, then refreshes keeping point on the row."
 
 (actionable-query-defview dashboard/work-calendar "📅 Today's Work Calendar"
   :objects #'dashboard--calendar-items
-  ;; Org-backed rows expose their marker so C-c C-s / t / : etc. work; gcal
-  ;; rows have no marker and stay link-only.
-  :org-deserializer (lambda (o) (plist-get o :marker))
-  ;; When an agenda key mints a tree from a gcal row, name it after the event
-  ;; and prefill SCHEDULED (today @ start) + Zoom/location/attendees.
-  :org-serializer #'dashboard--calendar-serializer
+  ;; Org-backed rows already expose their marker (use it directly so C-c C-s /
+  ;; t / : work); a gcal row has none, so upsert it: content-join by the event's
+  ;; title+start key, or mint a tree from `dashboard--calendar-serializer'
+  ;; (SCHEDULED today@start + Zoom/location/attendees) and stamp that key.
+  :org-upsert (lambda (o)
+                (or (plist-get o :marker)
+                    (actionable-query-upsert-org-tree
+                     :key        (format "%s %s" (or (plist-get o :title) "")
+                                         (or (plist-get o :start) ""))
+                     :title-spec (dashboard--calendar-serializer o))))
   :columns `((:name "Time" :width 18
                     :getter ,(lambda (o &rest _)
                                (dashboard--overlap-propertize o
@@ -908,7 +912,7 @@ always excluded.  Past that:
   "Org heading text for row O, preferring its node's headline over the calendar title.
 A Gerrit/Jira row minted via RET/C-c C-s carries a standup-ready headline
 \(`[[jira][TICKET]] Title :: <action>') --- read that off the marker so `s'
-reuses the work the `:org-serializer' already did.  Falls back to the
+reuses the work the `:org-upsert' already did.  Falls back to the
 calendar title for markerless or plain rows."
   (or (when-let ((m (plist-get o :marker)) ((marker-buffer m)))
         (org-with-point-at m
@@ -954,7 +958,7 @@ Work items are a numbered top level; meetings collapse into a single
   "`s' --- aggregate the day's work, copy as Slack mrkdwn, open the channel.
 Sources only WORK items (`:Work:' / 8am-4pm), omitting rituals.  Each row
 backed by an Org node contributes its standup headline (clickable ticket +
-`:: <action>', minted by the view's `:org-serializer'); meetings fold into a
+`:: <action>', minted by the view's `:org-upsert'); meetings fold into a
 trailing `Meetings ::' group.  Conversion to Slack mrkdwn --- links, the
 @-mention name map --- is delegated to `my/copy-as-slack'."
   (interactive)

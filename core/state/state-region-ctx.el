@@ -34,10 +34,10 @@ Set transiently by actions (e.g. `r') that want their confirmation to remain vis
   (editable-setters nil)   ; alist (column-index . setter-fn); mirrors the view
                            ; buffer's `aq--editable-setters' so `e' edits cells
                            ; in a splice without that buffer-local being present.
-  (org-serializer nil)     ; mirrors the view buffer's `aq--org-serializer' so
-                           ; RET / C-c C-s / I mint a rich heading (title/props/
-                           ; body from the view's `:org-serializer') in a splice,
-                           ; not the raw agenda-line text.
+  (org-upsert nil)         ; mirrors the view buffer's `aq--org-upsert' fn so
+                           ; RET / C-c C-s / I find-or-mint the heading in a
+                           ; splice (the `:org-upsert' round-trip), not the raw
+                           ; agenda-line text.
   (show-hearted-only nil)); per-region `H' toggle; the buffer-local
                           ; `aq--show-hearted-only' is wrong when several views
                           ; share one host buffer.

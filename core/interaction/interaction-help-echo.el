@@ -68,15 +68,15 @@ Suppressed while `aq--suppress-help-echo-until' is in the future."
   "Most-recently processed vtable object for org-marker; skips redundant `funcall org-fn' calls.")
 
 (defvar-local aq--org-key-marker-cache nil
-  "Lazily-built `row → marker' hash for a string-valued `:org-deserializer'.
-When `:org-deserializer' returns a STRING for a row (a content-join key such
+  "Lazily-built `row → marker' hash for a string-valued `:org-upsert'.
+When `:org-upsert' returns a STRING for a row (a content-join key such
 as a Jira ID rather than a marker), `aq-org-marker-of' resolves the whole
 current object batch once via `actionable-query-resolve-org-markers' and caches
 it here, so per-cursor lookups stay O(1) instead of re-scanning the notes file.")
 
 (defun aq-org-marker-of (obj org-fn)
   "Return the live Org marker OBJ maps to under ORG-FN, or nil.
-ORG-FN (the view's `:org-deserializer') may return either:
+ORG-FN (the view's `:org-upsert') may return either:
   • a live marker  → used directly (the row already knows its heading); or
   • a STRING        → a content-join key (e.g. a Jira ID) matched against
                       headings in `org-default-notes-file'.  The whole current

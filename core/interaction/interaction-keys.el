@@ -73,7 +73,7 @@ other default bindings (S, {, }, M-<left>, M-<right>) keep working.")
 (defun aq-nav-goto-row-heading ()
   "Go to the Org tree behind the current row (RET / TAB).
 If the row has no Org heading yet, one is created (via
-`aq-agenda--marker-or-create', honouring the view's `:org-serializer')
+`aq-agenda--marker-or-create', honouring the view's `:org-upsert')
 and the row's marker updated --- so RET always lands you on a real tree,
 no per-view RET binding needed.
 
