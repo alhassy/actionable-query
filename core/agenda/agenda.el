@@ -83,7 +83,7 @@ content-join --- e.g. a Jira ID written into the heading).
 
 Without SCOPE-MARKER the whole `org-default-notes-file' is searched.  With
 SCOPE-MARKER (a live marker on a parent heading) the search is restricted to
-that heading's subtree --- so a child key like `FWD-1@2026-07-03' is found only
+that heading's subtree --- so a child key like `PROJ-1@2026-07-03' is found only
 under its own parent, never a namesake elsewhere."
   (when (and (stringp key) (not (string-empty-p key)))
     (if scope-marker
@@ -100,19 +100,29 @@ under its own parent, never a namesake elsewhere."
               nil)))
       (when (and org-default-notes-file (file-exists-p org-default-notes-file))
         (with-current-buffer (find-file-noselect org-default-notes-file)
-          (save-excursion
-            (goto-char (point-min))
-            (catch 'found
-              ;; Pass 1 — durable `:AQ-KEY:' property match.
-              (org-map-entries
-               (lambda () (when (equal (org-entry-get (point) "AQ-KEY") key)
-                            (throw 'found (point-marker)))))
-              ;; Pass 2 — the KEY appears literally in a heading's text.
+          ;; `widen' is load-bearing: a leftover narrowing (from a capture or an
+          ;; interactive command) makes Pass 1's `org-map-entries' miss trees
+          ;; outside the region, silently falling through to the fragile Pass 2 —
+          ;; which then resolves to whatever ticket happens to sit in view.  That
+          ;; was the PROJ-A→PROJ-B mis-resolution.  Search the whole file, always.
+          (save-restriction
+            (widen)
+            (save-excursion
               (goto-char (point-min))
-              (when (re-search-forward (concat "^\\*+ .*" (regexp-quote key)) nil t)
-                (org-back-to-heading t)
-                (throw 'found (point-marker)))
-              nil)))))))
+              (catch 'found
+                ;; Pass 1 — durable `:AQ-KEY:' property match.
+                (org-map-entries
+                 (lambda () (when (equal (org-entry-get (point) "AQ-KEY") key)
+                              (throw 'found (point-marker)))))
+                ;; Pass 2 — KEY appears as a whole token in a heading's text.
+                ;; Word boundaries keep `PROJ-12' from matching `PROJ-1234', and a
+                ;; short key from matching a longer namesake.
+                (goto-char (point-min))
+                (when (re-search-forward
+                       (concat "^\\*+ .*\\_<" (regexp-quote key) "\\_>") nil t)
+                  (org-back-to-heading t)
+                  (throw 'found (point-marker)))
+                nil))))))))
 
 (defun actionable-query--create-org-tree (title props body &optional key parent-marker)
   "Create a `TODO TITLE' heading and return its marker.

@@ -32,7 +32,8 @@
   (require 'org-timestamp)
   (load-file (expand-file-name "timezone-convertor.el" here))
   (load-file (expand-file-name "celsius-fahrenheit-convertor.el" here))
-  (load-file (expand-file-name "work-calendar.el" here)))
+  (load-file (expand-file-name "work-calendar.el" here))
+  (load-file (expand-file-name "review.el" here)))
 
 ;; The `dashboard/rss-feeds' view + its feed list / actions live in
 ;; `rss.el' (required above); the dashboard just splices that view into
@@ -360,7 +361,14 @@ every section on every call."
         (let ((start (point-marker)))
           (insert "\n\n** " (dashboard--heading-link 'dashboard/work-in-progress "🚧 Gerrit: Work In Progress") "\n\n")
           (dashboard/work-in-progress :insert reuse-cache
-                                      :on-inserted (dashboard--hider reuse-cache start))))
+                                      :on-inserted (dashboard--hider reuse-cache start)))
+
+        ;; Weekly Review / Promise --- a shareable standup post, appended last so
+        ;; its async sub-views backfill without slowing the daily dashboard.
+        (insert "\n\n* 📝 "
+                (dashboard--heading-link 'review/weekly-promise "Weekly Review / Promise")
+                "  " "[[elisp:(review/copy-section-as-slack)][📋 Copy as Slack post]]" "\n\n")
+        (review/weekly-promise reuse-cache))
       (goto-char (point-min))))
   (pop-to-buffer "*Dashboard*"))
 

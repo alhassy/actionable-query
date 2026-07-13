@@ -20,7 +20,8 @@
   '(("🇯🇵" "Asia/Tokyo"          "Japan (Tokyo)")
     ("🇨🇦" "America/Toronto"     "Canada (Toronto)")
     ("🇺🇸" "America/Los_Angeles" "California (Los Angeles)")
-    ("🇮🇳" "Asia/Kolkata"        "India (Kolkata)"))
+    ("🇮🇳" "Asia/Kolkata"        "India (Kolkata)")
+    ("🇨🇭" "Europe/Zurich"       "Switzerland (Zurich)"))
   "Zones shown by `dashboard/world-clock', in display order.
 Each entry is (FLAG TZ LOCATION): FLAG is the emoji shown in the cell, TZ is
 any value the OS accepts in the `TZ' env var (an IANA zone name), and
