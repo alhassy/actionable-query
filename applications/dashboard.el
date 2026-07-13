@@ -249,6 +249,7 @@ every section on every call."
         (erase-buffer)
         (org-mode)
         (insert "#+title: Dashboard\n\n")
+        (insert "#+note: Avoid AI, you enjoy coding and PL so take pride and joy in “artisanally handcrafted code”! Also ‘./ai_usage.sh’!\n\n")
         ;; Clock + weather share one line, no heading --- the flags/emoji are
         ;; self-explanatory (hover for locations / conditions).
         (dashboard/world-clock :insert reuse-cache)
