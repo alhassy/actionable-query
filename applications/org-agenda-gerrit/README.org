@@ -1,0 +1,368 @@
+#+title: org-agenda-gerrit — Gerrit/Jira vtable views via actionable-query
+#+author: Musa Al-hassy
+#+options: toc:2
+
+Your Gerrit and Jira work surfaces as interactive, snooze-able,
+Org-linked vtable views — built on ~actionable-query-defview~ rather than
+~org-agenda-mode~, so every view gets async loading, a =?= transient of
+keybindings, session-persistent snoozing, and ~RET~/~TAB~/~I~/~o~ Org
+navigation, all with zero extra wiring.
+
+Each row carries a 3-layer ~help-echo~ tooltip that does not just
+/describe/ the change — it *prescribes the next best action*:
+
+#+begin_example
+Feedback from Ada is going stale — address it soon.
+ [size M] [ps 3] [6 comments]
+ 🧱 Stuck — schedule a sync discussion, split the change, or rethink the approach.
+#+end_example
+
+* Why this package exists
+
+Most Gerrit/Jira dashboards collect metrics — patchsets, comments, age,
+CI status — and leave /you/ to translate those numbers into action.
+
+~org-agenda-gerrit~ is opinionated about the opposite direction:
+
+1. *State detection.* Age, patchsets, comments, CI, reviewer count, shirt size.
+2. *Action mapping.* Rules that translate state into a prescribed next step —
+   the three-layer ~help-echo~ on every row.
+3. *Org integration.* ~RET~ on any row navigates to the linked Org heading;
+   each row is snooze-able across sessions via ~actionable-query~'s
+   persistence layer.
+
+Without (2) and (3), you have a report.  Reports get /glanced/ at;
+dashboards get /used/.
+
+* Getting started
+
+** Prerequisites
+
+- Emacs 29+, ~org-ql~ (MELPA), ~vtable~ (built-in), ~transient~ (built-in)
+- ~actionable-query~ — see [[https://github.com/alhassy/actionable-query][its README]]
+- ~dash~ and ~s~ (MELPA), ~easy-access~ (local)
+- SSH access to your Gerrit server (~ssh gerrit query~)
+- A =~/.netrc= entry for Jira so ~curl -sn <url>~ authenticates
+
+** Install
+
+#+begin_src emacs-lisp
+(load-file "~/actionable-query/actionable-query.el")
+(add-to-list 'load-path "~/org-agenda-gerrit")
+(require 'org-agenda-gerrit)
+#+end_src
+
+** Minimal configuration
+
+#+begin_src emacs-lisp
+(setq org-agenda-gerrit-ssh-host      "gerrit")                     ; ~/.ssh/config alias
+(setq org-agenda-gerrit-base-url      "https://gerrit.example.com")
+(setq org-agenda-gerrit-jira-base-url "https://jira.example.com/browse")
+(setq org-agenda-gerrit-user          "alice")
+#+end_src
+
+Open any view with ~M-x org-ql-view~ and select from the eight registered
+views.  The first open fires an async SSH/curl fetch — a ⏳ spinner holds
+the buffer until data arrives.  Subsequent opens are instant (data cached;
+~g~ refreshes on demand).
+
+* Configuration variables
+
+| Variable                               | Default                  | Purpose                                       |
+|----------------------------------------+--------------------------+-----------------------------------------------|
+| ~org-agenda-gerrit-ssh-command~        | ~/usr/bin/ssh~           | Path to SSH binary.                           |
+| ~org-agenda-gerrit-ssh-host~           | ~"gerrit"~               | SSH alias for the Gerrit server.              |
+| ~org-agenda-gerrit-base-url~           | ~""~                     | Gerrit web UI root, e.g. =https://gerrit.example.com=. |
+| ~org-agenda-gerrit-project-path~       | ~"/c/+/"~                | URL fragment between base URL and change number. |
+| ~org-agenda-gerrit-jira-base-url~      | ~""~                     | Jira browse root, e.g. =https://jira.example.com/browse=. |
+| ~org-agenda-gerrit-user~               | ~user-login-name~        | Gerrit/Jira username.                         |
+| ~org-agenda-gerrit-jira-ticket-regex~  | ~nil~                    | Regex (one capture group) to extract Jira IDs from commit messages. |
+
+The Jira REST base is derived by stripping ~/browse~ from
+~org-agenda-gerrit-jira-base-url~.
+
+* The ~org-agenda-gerrit-item~ struct
+
+Every row in every view is an instance of this struct:
+
+| Slot               | Type           | Description                                          |
+|--------------------+----------------+------------------------------------------------------|
+| ~jira~             | string or nil  | Primary Jira ticket ID, e.g. ~"BUG-42"~.            |
+| ~title~            | string         | Jira summary (or commit subject stripped of tags).   |
+| ~tip-url~          | string or nil  | Gerrit change URL (nil for pure Jira items).         |
+| ~reviewers~        | list of strings | Display names of human reviewers.                   |
+| ~reviewer-users~   | alist          | ~(display-name . username)~ pairs.                   |
+| ~author~           | string or nil  | Gerrit change owner display name.                    |
+| ~reporter~         | string or nil  | Jira issue reporter (Jira items only).               |
+| ~urgent~           | boolean        | ~t~ when the Jira ticket appears in the urgent JQL.  |
+| ~age~              | float or nil   | ~lastUpdated~ as Unix epoch.                         |
+| ~stack-size~       | integer        | Number of changes in the dependency stack.           |
+| ~max-patchsets~    | integer        | Highest patchset number across the stack.            |
+| ~comment-count~    | integer        | Total inline comments across the stack.              |
+| ~avg-shirt-size~   | float or nil   | Average shirt size (1 XS → 5 XL) across the stack.  |
+| ~ci-status~        | ~'pass~, ~'fail~, nil | Verified vote on the tip change.            |
+| ~has-code-review~  | boolean        | Non-nil if a non-owner gave a positive Code-Review.  |
+| ~blocked-by-parent~| boolean        | Non-nil if the tip depends on an unmerged parent.    |
+
+* The eight built-in views
+
+Open any of these with ~M-x org-ql-view~:
+
+| View name                                 | Source   | Query intent                                    |
+|-------------------------------------------+----------+-------------------------------------------------|
+| =👀 Gerrit: Reviews Needed=               | Gerrit   | Changes by others in my attention set           |
+| =🔧 Gerrit: My Changes Needing Action=    | Gerrit   | My changes where reviewer feedback is waiting   |
+| =⏳ Gerrit: Please Review My Work=        | Gerrit   | My open changes not yet in the attention set    |
+| =🚧 Gerrit: Work In Progress=             | Gerrit   | My WIP (draft) changes                          |
+| =📋 Jira: Urgent Not Yet Started=         | Jira     | Urgent tickets due next month, not yet started  |
+| =⚠️ Jira: Active But No Gerrit Changes=   | Jira     | In-flight Jira tickets with no backing change   |
+| =📌 Jira: Assigned To Me=                 | Jira     | Assigned but not in-flight                      |
+| =✅ Jira: Done This Week=                 | Jira     | Resolved in the past 7 days                     |
+
+All eight are registered in ~org-ql-views~ automatically on ~require~.
+
+* Column layouts
+
+** Gerrit views — ~org-agenda-gerrit-columns~
+
+: Age | Jira | Author | PS | Size | Subject
+
+- *Age* — ~lastUpdated~ formatted as ~"3d"~, ~"2w"~, ~"1mo"~, etc. (dim gray)
+- *Jira* — ticket ID in forest green bold; empty string when absent
+- *Author* — Gerrit change owner display name
+- *PS* — highest patchset number across the stack
+- *Size* — average shirt size: XS / S / M / L / XL
+- *Subject* — Jira summary (or stripped commit subject); prefixed ~"🔴 "~ when urgent
+
+** Jira views — ~org-agenda-gerrit-jira-columns~
+
+: Age | Jira | Reporter | Subject
+
+Gerrit-only columns (Author, PS, Size) are axed; Reporter replaces Author.
+
+* The 3-layer ~help-echo~ tooltip
+
+Every row's minibuffer tooltip has three layers:
+
+#+begin_example
+Address feedback from Ada — CI is green.           ← Layer 1: what to do
+ [size M] [ps 3] [6 comments] [CI ✗]               ← Layer 2: bracketed metadata
+ 🔴 CI is red — fix the build before anything else. ← Layer 3: priority nudge
+#+end_example
+
+**Layer 1** (bold) — staleness-tiered action text, set per view via
+~org-agenda-gerrit--help-echo-tiered~ (fresh / ≥14d stale / ≥30d very-stale)
+or pinned via ~org-agenda-gerrit--help-echo-with~.
+
+**Layer 2** (dim) — bracketed metadata: stack size, shirt size, patchsets,
+comments, reviewer count, CI, blocked, urgent flags.
+
+**Layer 3** (color-coded) — highest-priority strategic nudge, evaluated in
+order:
+
+| Signal       | Condition                         | Nudge                                               |
+|--------------+-----------------------------------+-----------------------------------------------------|
+| 🔴 CI red    | ~ci-status = 'fail~               | Fix the build before anything else                  |
+| 🔗 Blocked   | unmerged parent in stack          | Land the dependency first                           |
+| 🧱 Stuck     | many ps + many comments + stale   | Sync discussion, split, or rethink                  |
+| ⚠ Escalate   | many ps + many comments (fresh)   | Escalate to synchronous conversation                |
+| ⚠ Abandon    | very old + large + many ps        | Abandon and re-open as smaller pieces               |
+| 💡 Split     | shirt size L or XL                | Split into smaller stack                            |
+| 💡 Spin off  | many comments, few patchsets      | Spin off unrelated cleanup                          |
+| 👥 Widen     | solo reviewer + stale             | Add a reviewer or re-assign                         |
+| 👥 Narrow    | more than 2 reviewers             | Narrow to 1–2 primary reviewers                     |
+| ✅ Approve   | CI green + no Code-Review         | Ask reviewers for final approval                    |
+| 🔄 Rebase    | older than 7 days                 | Rebase to stay current with target branch           |
+
+* Org-marker integration
+
+Pressing ~RET~ / ~TAB~ / ~I~ / ~o~ on any row navigates to the linked Org
+heading — the same muscle memory as ~org-agenda-mode~.
+
+** How it works
+
+After each async Gerrit or Jira fetch completes,
+~org-agenda-gerrit--build-org-cache~ calls ~actionable-query-resolve-org-markers~
+(from ~actionable-query.el~) to scan ~org-default-notes-file~ for headings
+whose text contains the item's Jira ticket ID.  Results are stored in
+~org-agenda-gerrit--org-marker-cache~ (a global hash-table keyed by item
+identity).  Every view's ~:org~ lambda reads from this cache in O(1):
+
+#+begin_src emacs-lisp
+:org (lambda (o) (gethash o org-agenda-gerrit--org-marker-cache))
+#+end_src
+
+No per-view wiring required — the cache is populated once per fetch for all
+views simultaneously.
+
+** The ~actionable-query-resolve-org-markers~ helper
+
+The two-pass resolver lives in ~actionable-query.el~ and is reusable by any
+view:
+
+#+begin_src emacs-lisp
+(actionable-query-resolve-org-markers objects key-fn &optional fallback-fn)
+#+end_src
+
+- **Pass 1** — for each object, call ~key-fn~ to get a string (e.g. ~"BUG-42"~);
+  scan ~org-default-notes-file~ for a heading containing that string; store
+  the marker.
+- **Pass 2** — for objects still without a marker, call ~fallback-fn (obj
+  table)~ if non-nil.
+
+* Urgent 🔴 annotation
+
+Items whose Jira ticket appears in the urgent-JQL result are stamped
+~:urgent t~ before the view renders:
+
+- Subject column shows ~"🔴 "~ prefix
+- Layer 2 meta includes ~"[URGENT]"~
+
+The urgent fetch (~org-agenda-gerrit--urgent-ids-async~) fires asynchronously
+via ~aq--cli-async~ after the Gerrit SSH data arrives; it does not block the
+initial render.  The JQL is:
+
+#+begin_src emacs-lisp
+(format "(Urgency = \"1 month\" OR fixVersion = \"%d.%d\") AND resolution = Unresolved AND assignee = %s"
+        next-yr next-mon org-agenda-gerrit-user)
+#+end_src
+
+* Preset keywords
+
+Three reusable ~defview-def-keyword~ presets reduce each view to a one-liner:
+
+- ~:gerrit-query QUERY-STRING~ — Gerrit SSH fetch, stacks split per ticket
+- ~:gerrit-query-by-author QUERY-STRING~ — same but split per ticket×author
+  (used for Reviews Needed, where multiple colleagues' changes on the same
+  ticket each deserve their own row)
+- ~:jira-query JQL-THUNK-FORM~ — async curl Jira fetch; ~JQL-THUNK-FORM~ is
+  a zero-arg function so month-sensitive queries stay fresh
+
+All three presets wire ~:org~, ~:help-echo~, ~:snooze-period~, ~:auto-refresh~,
+~:actions~, and ~:columns~ automatically.  Any explicit kwarg at the call site
+overrides the preset default.
+
+* Built-in keybindings
+
+All ~actionable-query-defview~ keybindings apply:
+
+| Key | Action                                   |
+|-----+------------------------------------------|
+| ~g~ | Refresh (re-fire the async fetch)        |
+| ~r~ | Snooze current row (persisted forever)   |
+| ~R~ | Resurrect all snoozed rows               |
+| ~?~ | Transient popup: all actions             |
+| ~q~ | Bury buffer                              |
+
+Plus the view-specific ~:actions~:
+
+| Key   | Action                              |
+|-------+-------------------------------------|
+| ~RET~ | Open Gerrit change in browser       |
+| ~j~   | Open Jira ticket in browser         |
+| ~w~   | Copy title to kill-ring             |
+| ~c~   | Capture row as Org TODO             |
+
+(Jira views swap ~RET~ → Open Jira ticket, since there is no Gerrit URL.)
+
+* Scheduling with ~actionable-query-next-free-slot~
+
+The ~actionable-query-scheduler~ companion (from the ~actionable-query~
+repo) integrates naturally with any action:
+
+#+begin_src emacs-lisp
+("s" "Schedule now"
+ (lambda (o)
+   (let ((stamp (actionable-query-next-free-slot 60)))
+     (org-capture-string
+      (format "* TODO %s %s\nSCHEDULED: %s"
+              (or (org-agenda-gerrit-item-jira o) "")
+              (org-agenda-gerrit-item-title o)
+              stamp)
+      "t"))))
+#+end_src
+
+~actionable-query-next-free-slot~ inspects your Org agenda files, avoids
+busy intervals, rounds to 15-minute boundaries, and rolls forward up to 14
+days if today is full.  See the ~actionable-query~ README for full details.
+
+* How it works internally
+
+** Async Gerrit fetch pipeline
+
+#+begin_example
+  org-agenda-gerrit--fetch-async
+    │
+    ├─ start-process (SSH gerrit query --format=JSON …)
+    │
+    └─ sentinel fires on exit:
+         1. Parse newline-delimited JSON → change alists
+         2. Group into dependency stacks (Union-Find + BFS bridge resolution)
+         3. Split stacks into org-agenda-gerrit-item structs
+         4. Batch-fetch Jira titles synchronously (curl call-process)
+         5. Fire org-agenda-gerrit--urgent-ids-async:
+              └─ async curl for urgent JQL
+              └─ stamp :urgent t on matching items
+              └─ call outer callback (vtable renders)
+              └─ call org-agenda-gerrit--build-org-cache (Org markers)
+#+end_example
+
+** Stack grouping (Union-Find + BFS)
+
+Gerrit changes that depend on each other form dependency stacks.  We group
+them so each stack surface as a single row:
+
+1. Build an edge map from ~dependsOn~ / ~neededBy~ fields.
+2. BFS outward (up to ~org-agenda-gerrit--bridge-max-depth~ = 5 hops) to
+   discover intermediate "bridge" changes not in the original query result.
+3. Union-Find merges transitively connected changes.
+4. Topo-sort each group (base first, tip last) so rendering follows logical order.
+
+** Shirt sizes — surface area, not line count
+
+Each change carries a shirt size derived from ~sizeInsertions + sizeDeletions~:
+XS ≤ 10, S ≤ 50, M ≤ 250, L ≤ 1000, XL > 1000.  The intuition: a 20×180
+patch has surface area 3,600 — the same total lines as a 200×0 patch but
+a radically different review burden, because every insertion potentially
+interacts with every deletion.
+
+* Testing
+
+~tests.el~ exercises the full pipeline — from raw Gerrit JSON through stack
+grouping and item construction — with zero network calls.
+
+#+begin_src sh
+emacs --batch -L ~/org-agenda-gerrit -L ~/actionable-query -L ~/snap \
+      --eval '(package-initialize)' \
+      -l tests.el -f ert-run-tests-batch-and-exit
+#+end_src
+
+Tests use ~snap-define-relation ng-view~: a fixture that opens a minimal
+~actionable-query-defview~ pre-loaded with test-constructed items (bypassing
+the real SSH/curl fetches), captures the vtable buffer as a string, and
+asserts via ~snap-equal-modulo~.  Expected snapshots are populated
+interactively with ~C-u C-x C-e~ inside each test form.
+
+The DSL helpers (~ng-test--as-gerrit-patch~, ~ng-test--as-gerrit-stack~,
+~ng-test--stack-from-string~) build minimal Gerrit change alists from
+compact string fixtures — no live server required.
+
+* Troubleshooting
+
+- */"org-agenda-gerrit-base-url is empty"/* — set the four endpoint
+  variables (see [[*Minimal configuration][Minimal configuration]]).
+- */Jira titles missing/* — check that ~curl -sn <jira-rest-url>~
+  authenticates via =~/.netrc=; the batch title fetch is synchronous and
+  silent on auth failure.
+- */Org markers not resolving/* — verify that ~org-default-notes-file~
+  points to a file containing headings whose text includes the Jira ticket
+  IDs.
+- */Urgent annotation missing/* — the urgent JQL fetch is async and fires
+  after the main callback; if the view renders before it completes, press
+  ~g~ to refresh.
+
+* Credits
+
+Extracted from my personal literate Emacs configuration (~=~/.emacs.d/init.org=~)
+and rewritten atop ~actionable-query-defview~ for a cleaner, vtable-native
+architecture.  PRs welcome.
